@@ -76,7 +76,8 @@ func (r *Resampler) drain(limit int) []float64 {
 		r.pos = p
 		out = append(out, r.at(p))
 	}
-	keep := int(r.pos - w)
+	// pos is absolute; the drop count must be relative to in's window
+	keep := int(r.pos-w) - r.base
 	if keep > len(r.in) {
 		keep = len(r.in)
 	}

@@ -7,6 +7,7 @@ import (
 	"log"
 	"math"
 	"runtime"
+	"time"
 
 	"github.com/egoist/mygo"
 
@@ -25,11 +26,11 @@ type State struct {
 
 // FileResult is the outcome of morphing a whole clip.
 type FileResult struct {
-	Wav      string  `json:"wav"`      // base64 16-bit PCM WAV, 48 kHz mono
-	Seconds  float64 `json:"seconds"`  // output duration
-	InHz     int     `json:"inHz"`     // input sample rate
-	OutHz    int     `json:"outHz"`    // output sample rate
-	Elapsed  float64 `json:"elapsed"`  // DSP wall time, ms
+	Wav     string  `json:"wav"`     // base64 16-bit PCM WAV, 48 kHz mono
+	Seconds float64 `json:"seconds"` // input duration
+	InHz    int     `json:"inHz"`    // input sample rate
+	OutHz   int     `json:"outHz"`   // output sample rate
+	Elapsed float64 `json:"elapsed"` // DSP wall time, ms
 }
 
 // Morpher is the bound service: the page calls these methods.
@@ -103,12 +104,13 @@ func (m *Morpher) ProcessFile(wavB64 string) (FileResult, error) {
 		pcm = resampleTo(pcm, sr, engine.SampleRate)
 	}
 	secs := float64(len(pcm)) / engine.SampleRate
+	t0 := time.Now()
 	out := m.eng.Render(pcm)
 	return FileResult{
 		Wav:     base64.StdEncoding.EncodeToString(engine.EncodeWAV(out, engine.SampleRate)),
 		Seconds: secs,
 		InHz:    sr, OutHz: engine.SampleRate,
-		Elapsed: float64(len(out)) / engine.SampleRate * 1000,
+		Elapsed: float64(time.Since(t0)) / 1e6,
 	}, nil
 }
 

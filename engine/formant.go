@@ -138,7 +138,10 @@ func (f *Formant) step() {
 	for k := 0; k < nh; k++ {
 		src := float64(k) / f.warp
 		if src > float64(nh-1) {
-			src = float64(nh - 1)
+			// warp<1 pushes src past the top bin: nothing to warp
+			// toward, so leave this bin's envelope unchanged
+			f.gain[k] = 1
+			continue
 		}
 		i0 := int(src)
 		fr := src - float64(i0)
@@ -147,7 +150,11 @@ func (f *Formant) step() {
 			i1 = nh - 1
 		}
 		warpedEnv := f.env[i0]*(1-fr) + f.env[i1]*fr
-		g := (warpedEnv - f.env[k]) * f.strength
+		// clamp the log-gain (±6 nepers ≈ ±52 dB): a spectral valley
+		// mapped onto a peak would otherwise gain thousands-fold and
+		// amplify the noise floor into audible hiss / clipping, while
+		// still leaving room for large timbre warps
+		g := clamp((warpedEnv-f.env[k])*f.strength, -6, 6)
 		f.gain[k] = math.Exp(g)
 	}
 

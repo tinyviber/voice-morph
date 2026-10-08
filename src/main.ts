@@ -73,14 +73,19 @@ function bindFaders() {
   const timbre = $<HTMLInputElement>("#timbre");
   const strength = $<HTMLInputElement>("#strength");
 
-  const on = () => {
+  // morph params rebuild the engine's streaming stages (~128ms hole):
+  // dragging must only update readouts; commit on release ('change')
+  const on = (commit: boolean) => () => {
     params.pitch = +pitch.value;
     params.timbre = +timbre.value;
     params.strength = +strength.value / 100;
     reflectReadouts();
-    scheduleSend();
+    if (commit) scheduleSend();
   };
-  for (const el of [pitch, timbre, strength]) el.addEventListener("input", on);
+  for (const el of [pitch, timbre, strength]) {
+    el.addEventListener("input", on(false));
+    el.addEventListener("change", on(true));
+  }
 
   $("#reset").onclick = () => {
     params.pitch = params.timbre = 0;
@@ -171,6 +176,7 @@ function syncEqInputs() {
 let ctx: AudioContext | undefined;
 let stream: MediaStream | undefined;
 let node: AudioWorkletNode | undefined;
+let resultUrl: string | undefined;
 let running = false;
 let outLevel = 0;
 const scopeBuf = new Float32Array(4800);
@@ -188,20 +194,19 @@ async function startMonitor() {
   });
   const src = ctx.createMediaStreamSource(stream);
   node = new AudioWorkletNode(ctx, "duplex", { outputChannelCount: [1] });
-  let inFlight = false;
-  node.port.onmessage = async (e) => {
+  // serialize IPC through a promise chain: every captured block is
+  // sent (dropping whole blocks would punch content holes — deleted
+  // syllables — into the morphed stream)
+  let chain: Promise<void> = Promise.resolve();
+  node.port.onmessage = (e) => {
     const block: Float32Array = e.data.in;
     feedScope(block);
-    if (inFlight) return; // drop input rather than grow latency
-    inFlight = true;
-    try {
+    chain = chain.then(async () => {
       const outB64 = await bridge.processChunk(f32ToB64(block));
       const out = b64ToF32(outB64);
       outLevel = rms(out);
-      node!.port.postMessage(out, [out.buffer]);
-    } finally {
-      inFlight = false;
-    }
+      node?.port.postMessage(out, [out.buffer]);
+    }).catch(() => {}); // keep the chain alive on a failed call
   };
   src.connect(node);
   node.connect(ctx.destination);
@@ -228,7 +233,10 @@ function bindMonitor() {
       return;
     }
     try {
-      await startMonitor();
+      await startMonitor().catch((err) => {
+        stopMonitor(); // release mic/graph if setup died midway
+        throw err;
+      });
       running = true;
       $("#monitor").textContent = "停止监听";
       $("#monitor").classList.add("live");
@@ -288,7 +296,11 @@ function bindFile() {
     const f = e.dataTransfer?.files[0];
     if (f) void morphFile(f);
   };
-  input.onchange = () => input.files?.[0] && void morphFile(input.files[0]);
+  input.onchange = () => {
+    const f = input.files?.[0];
+    input.value = ""; // allow re-picking the same file
+    if (f) void morphFile(f);
+  };
 }
 
 async function morphFile(file: File) {
@@ -297,8 +309,9 @@ async function morphFile(file: File) {
   try {
     const raw = await file.arrayBuffer();
     // decode any audio format with Web Audio, resample to 48 kHz mono WAV
-    const ac = new OfflineAudioContext(1, 1, 48000);
+    const ac = new AudioContext();
     const buf = await ac.decodeAudioData(raw);
+    void ac.close();
     const off = new OfflineAudioContext(1, Math.ceil(buf.duration * 48000), 48000);
     const s = off.createBufferSource();
     s.buffer = buf;
@@ -311,7 +324,9 @@ async function morphFile(file: File) {
     if (!out.wav) throw new Error("引擎未返回音频（浏览器预览模式）");
     const wavBytes = b64ToBytes(out.wav);
     const blob = new Blob([wavBytes.buffer as ArrayBuffer], { type: "audio/wav" });
+    resultUrl?.startsWith("blob:") && URL.revokeObjectURL(resultUrl);
     const url = URL.createObjectURL(blob);
+    resultUrl = url;
     $<HTMLAudioElement>("#result-player").src = url;
     $<HTMLAnchorElement>("#download").href = url;
     result.hidden = false;

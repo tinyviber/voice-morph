@@ -31,12 +31,19 @@ func DecodeWAV(data []byte) ([]float32, int, error) {
 			return nil, 0, err
 		}
 		size := int(binary.LittleEndian.Uint32(hdr[4:8]))
-		body := make([]byte, size+size%2)
+		want := size + size%2
+		if want < 0 || want > r.Len() {
+			return nil, 0, io.ErrUnexpectedEOF // declared size exceeds the file
+		}
+		body := make([]byte, want)
 		if _, err := io.ReadFull(r, body); err != nil {
 			return nil, 0, err
 		}
 		switch string(hdr[0:4]) {
 		case "fmt ":
+			if len(body) < 16 {
+				return nil, 0, errors.New("WAVE: short fmt chunk")
+			}
 			format = int(binary.LittleEndian.Uint16(body[0:2]))
 			channels = int(binary.LittleEndian.Uint16(body[2:4]))
 			sr = int(binary.LittleEndian.Uint32(body[4:8]))
@@ -45,8 +52,16 @@ func DecodeWAV(data []byte) ([]float32, int, error) {
 			pcm = body[:size]
 		}
 	}
-	if pcm == nil || channels < 1 || sr < 1 {
-		return nil, 0, errors.New("WAVE: missing fmt or data chunk")
+	if pcm == nil || channels < 1 || sr < 1 || bits < 8 {
+		return nil, 0, errors.New("WAVE: missing or invalid fmt/data chunk")
+	}
+	// only these (format, bits) pairs are supported; validate before
+	// dividing by bits/8 so malformed headers error instead of panic
+	supported :=
+		(format == 1 && (bits == 8 || bits == 16 || bits == 24 || bits == 32)) ||
+			(format == 3 && (bits == 32 || bits == 64))
+	if !supported {
+		return nil, 0, fmt.Errorf("WAVE: unsupported format %d/%d-bit", format, bits)
 	}
 	frames := len(pcm) / channels / (bits / 8)
 	out := make([]float32, frames)

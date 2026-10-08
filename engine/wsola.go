@@ -8,16 +8,16 @@ import "math"
 // grain's input position is searched within ±delta of its nominal position
 // for maximum similarity with the previous grain's continuation.
 type WSOLA struct {
-	frame  int
-	hs     int
-	ov     int
-	delta  int
-	alpha  float64
-	win    []float64
-	in     []float64
-	base   int     // absolute index of in[0]
-	prev   int     // absolute position of the last placed grain (-1: none)
-	apos   float64 // accumulating nominal analysis position; independent of
+	frame int
+	hs    int
+	ov    int
+	delta int
+	alpha float64
+	win   []float64
+	in    []float64
+	base  int     // absolute index of in[0]
+	prev  int     // absolute position of the last placed grain (-1: none)
+	apos  float64 // accumulating nominal analysis position; independent of
 	// prev so that the ±1-period jitter of periodic input does not drift
 	out    []float64 // pending output tail (< frame samples before a grain lands)
 	energy []float64 // prefix sums of in² for fast NCC denominators
@@ -73,7 +73,6 @@ func (w *WSOLA) drain(flush bool) []float64 {
 			continue
 		}
 		c := w.apos
-		w.apos += float64(w.hs) * w.alpha
 		lo := int(math.Ceil(c - float64(w.delta)))
 		hi := int(math.Floor(c + float64(w.delta)))
 		// grains must strictly advance in the input, or a long overlap
@@ -84,14 +83,21 @@ func (w *WSOLA) drain(flush bool) []float64 {
 		if hi < lo {
 			hi = lo
 		}
-		if avail < hi+w.ov && !flush {
-			break // need more input to score the furthest candidate
+		if avail < hi+w.frame && !flush {
+			// the furthest candidate's whole frame must be buffered:
+			// place() reads [p, p+frame), and a tail read past avail is
+			// silently skipped (never re-added later), permanently
+			// denting this and the next three hops
+			break
 		}
 		p := w.pick(lo, hi, c)
 		w.place(p)
 		emitted = append(emitted, w.out[:w.hs]...)
 		w.out = append([]float64(nil), w.out[w.hs:]...)
 		w.prev = p
+		// advance the nominal position only when a hop was actually
+		// emitted — a stalled iteration must not skip c's content
+		w.apos = c + float64(w.hs)*w.alpha
 		// drop input no grain can reach again
 		drop := w.prev - w.base - w.delta - w.frame
 		if drop > 0 {

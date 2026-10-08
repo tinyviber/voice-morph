@@ -74,7 +74,7 @@ func (e *Engine) setParamsLocked(p Params) {
 	e.pre.SetGains(p.EqPre, e.sr)
 	e.post.SetGains(p.EqPost, e.sr)
 	if r != e.pitchR {
-		e.res = NewResampler(1 / r)   // shrink duration by r
+		e.res = NewResampler(1 / r)                      // shrink duration by r
 		e.wso = NewWSOLA(1/r, 2048, 512, 256, int(e.sr)) // stretch back by r
 		e.pitchR = r
 	}
@@ -111,21 +111,31 @@ func (e *Engine) rebuildLocked() {
 	e.timbreW, e.strength = math.Pow(2, e.params.Timbre), e.params.Strength
 }
 
+// morphActive reports whether the pitch/timbre section does any work;
+// at neutral params it is skipped entirely (lower latency, truly
+// transparent "原声").
+func (e *Engine) morphActive() bool {
+	return e.pitchR != 1 || e.timbreW != 1
+}
+
 // Process runs one block through the chain.
 func (e *Engine) Process(in []float32) []float32 {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if e.params.Bypass {
+		return append([]float32(nil), in...)
+	}
 	x := make([]float64, len(in))
 	for i, v := range in {
 		x[i] = float64(v)
 	}
-	if !e.params.Bypass {
-		x = e.pre.Process(x)
+	x = e.pre.Process(x)
+	if e.morphActive() {
 		x = e.res.Process(x)
 		x = e.wso.Process(x)
 		x = e.form.Process(x)
-		x = e.post.Process(x)
 	}
+	x = e.post.Process(x)
 	g := e.params.Gain
 	out := make([]float32, len(x))
 	for i, v := range x {
@@ -134,21 +144,46 @@ func (e *Engine) Process(in []float32) []float32 {
 	return out
 }
 
+// Flush drains the streaming stages' tails and resets the engine, so a
+// live session can end cleanly. Terminal for the current stream.
+func (e *Engine) Flush() []float32 {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	var out []float32
+	if !e.params.Bypass && e.morphActive() {
+		x := e.res.Flush()
+		x = e.wso.Process(x)
+		x = append(x, e.wso.Flush()...)
+		x = e.form.Process(x)
+		x = append(x, e.form.Flush()...)
+		x = e.post.Process(x)
+		g := e.params.Gain
+		out = make([]float32, len(x))
+		for i, v := range x {
+			out[i] = float32(softClip(v * g))
+		}
+	}
+	e.rebuildLocked()
+	return out
+}
+
 // Render processes a whole clip offline, flushing every stage's tail.
 func (e *Engine) Render(in []float32) []float32 {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if e.params.Bypass {
+		return append([]float32(nil), in...)
+	}
 	x := make([]float64, len(in))
 	for i, v := range in {
 		x[i] = float64(v)
 	}
-	if e.params.Bypass {
-		return append([]float32(nil), in...)
-	}
 	x = e.pre.Process(x)
-	x = append(e.res.Process(x), e.res.Flush()...)
-	x = append(e.wso.Process(x), e.wso.Flush()...)
-	x = append(e.form.Process(x), e.form.Flush()...)
+	if e.morphActive() {
+		x = append(e.res.Process(x), e.res.Flush()...)
+		x = append(e.wso.Process(x), e.wso.Flush()...)
+		x = append(e.form.Process(x), e.form.Flush()...)
+	}
 	x = e.post.Process(x)
 	g := e.params.Gain
 	out := make([]float32, len(x))

@@ -172,26 +172,127 @@ func TestWAVRoundTrip(t *testing.T) {
 	}
 }
 
+// maxDiff returns the largest absolute per-sample difference.
+func maxDiff(a, b []float32) float64 {
+	n := len(a)
+	if len(b) < n {
+		n = len(b)
+	}
+	d := 0.0
+	for i := 0; i < n; i++ {
+		if v := math.Abs(float64(a[i] - b[i])); v > d {
+			d = v
+		}
+	}
+	return d
+}
+
+// Chunked Process + Flush must equal a single Render sample-for-sample:
+// the streaming path is the live-monitor path and any drift is audible.
 func TestStreamingMatchesRender(t *testing.T) {
 	in := sine(200, 0.5, SampleRate)
-	e := New()
-	p := DefaultParams
-	p.Pitch = 0.5
-	e.SetParams(p)
-	full := e.Render(in)
+	for _, pitch := range []float64{-0.5, 0.5} {
+		e := New()
+		p := DefaultParams
+		p.Pitch = pitch
+		e.SetParams(p)
+		full := e.Render(in)
 
-	e.SetParams(p)
-	var streamed []float32
-	const chunk = 2048
-	for i := 0; i < len(in); i += chunk {
-		end := i + chunk
-		if end > len(in) {
-			end = len(in)
+		var streamed []float32
+		const chunk = 2048
+		for i := 0; i < len(in); i += chunk {
+			end := i + chunk
+			if end > len(in) {
+				end = len(in)
+			}
+			streamed = append(streamed, e.Process(in[i:end])...)
 		}
-		streamed = append(streamed, e.Process(in[i:end])...)
+		streamed = append(streamed, e.Flush()...)
+
+		if len(streamed) != len(full) {
+			t.Fatalf("pitch %+v: streamed %d samples, render %d", pitch, len(streamed), len(full))
+		}
+		if d := maxDiff(streamed, full); d > 1e-5 {
+			t.Fatalf("pitch %+v: streamed vs render max|diff| = %g", pitch, d)
+		}
 	}
-	// streaming output may lag a bit behind; compare steady-state region
-	if len(streamed) < len(full)/4 {
-		t.Fatalf("streamed %d samples for %d rendered", len(streamed), len(full))
+}
+
+// WSOLA must conserve length: output ≈ input/alpha regardless of the
+// chunking it was fed (a stalled hop must not eat content).
+func TestWSOLALengthConserved(t *testing.T) {
+	in := sine(150, 1.0, SampleRate)
+	x := make([]float64, len(in))
+	for i, v := range in {
+		x[i] = float64(v)
 	}
+	for _, alpha := range []float64{0.5, 1.0, 2.0} {
+		w := NewWSOLA(alpha, 2048, 512, 256, SampleRate)
+		var out []float64
+		for i := 0; i < len(x); i += 2048 {
+			end := i + 2048
+			if end > len(x) {
+				end = len(x)
+			}
+			out = append(out, w.Process(x[i:end])...)
+		}
+		out = append(out, w.Flush()...)
+		want := float64(len(x)) / alpha
+		if math.Abs(float64(len(out))-want) > 2*2048 {
+			t.Errorf("alpha %v: got %d samples, want ~%.0f (±1 frame)", alpha, len(out), want)
+		}
+	}
+}
+
+// Malformed WAVs must return an error, never panic.
+func TestDecodeWAVMalformed(t *testing.T) {
+	good := EncodeWAV(sine(440, 0.05, SampleRate), SampleRate)
+	cases := map[string][]byte{
+		"empty":      {},
+		"not-wave":   []byte("NOPE........WAVE"),
+		"truncated":  good[:20],
+		"huge-size":  wavWithHugeSize(),
+		"short-fmt":  wavWithShortFmt(),
+		"zero-bits":  wavWithBits(0),
+		"weird-bits": wavWithBits(4),
+	}
+	for name, data := range cases {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Errorf("%s: panicked: %v", name, r)
+				}
+			}()
+			if _, _, err := DecodeWAV(data); err == nil {
+				t.Errorf("%s: expected error, got none", name)
+			}
+		}()
+	}
+}
+
+// wavWithShortFmt builds a RIFF with a 4-byte fmt chunk and a data chunk.
+func wavWithShortFmt() []byte {
+	var b []byte
+	b = append(b, "RIFF"...)
+	b = append(b, 0, 0, 0, 0)
+	b = append(b, "WAVE"...)
+	b = append(b, "fmt "...)
+	b = append(b, 4, 0, 0, 0, 1, 0, 0, 0) // size=4, body=4 bytes
+	b = append(b, "data"...)
+	b = append(b, 4, 0, 0, 0, 0, 0, 0, 0)
+	return b
+}
+
+// wavWithBits builds a well-formed RIFF whose fmt chunk declares bps bits.
+func wavWithBits(bps byte) []byte {
+	data := EncodeWAV(sine(440, 0.01, SampleRate), SampleRate)
+	data[34] = bps // bitsPerSample field inside fmt chunk
+	return data
+}
+
+// wavWithHugeSize declares a ~4 GB fmt chunk followed by almost no data.
+func wavWithHugeSize() []byte {
+	data := EncodeWAV(sine(440, 0.01, SampleRate), SampleRate)[:24]
+	data[16], data[17], data[18], data[19] = 0xFF, 0xFF, 0xFF, 0xF0
+	return data
 }
