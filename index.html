@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>VoiceMorph · 变声工坊</title>
+    <link rel="stylesheet" href="./src/style.css" />
+  </head>
+  <body>
+    <div class="app">
+      <!-- ══ sidebar: brand + voice presets ══ -->
+      <aside class="rail">
+        <div class="brand">
+          <svg class="brand-mark" viewBox="0 0 28 28" aria-hidden="true">
+            <rect x="1.5" y="1.5" width="25" height="25" rx="7" class="mark-tile" />
+            <path d="M7 14c1.4-3.6 2.8-5.4 4.2-5.4S13.6 11.6 14 14s1.6 5.4 2.9 5.4 2.8-1.8 4.1-5.4" class="mark-wave" />
+          </svg>
+          <div class="brand-text">
+            <h1>VoiceMorph</h1>
+            <p>Go 变声器 · 变声工坊</p>
+          </div>
+        </div>
+
+        <p class="rail-label">声音预设 <span>Voices</span></p>
+        <div id="presets" class="presets"></div>
+
+        <div class="rail-foot">
+          <span id="platform" class="chip"></span>
+          <span class="dot-sep"></span>
+          <span id="engine-rate" class="chip"></span>
+        </div>
+      </aside>
+
+      <!-- ══ main ══ -->
+      <main class="stage">
+        <header class="topbar">
+          <div class="topbar-title">
+            <h2>实时变声</h2>
+            <p class="sub">麦克风 → Go 引擎 → 监听</p>
+          </div>
+          <div class="topbar-actions">
+            <button id="bypass" class="btn ghost" aria-pressed="false" title="对比原声">旁通原声</button>
+            <button id="monitor" class="btn primary big">开始监听</button>
+          </div>
+        </header>
+
+        <section class="cards">
+          <!-- transport / meters -->
+          <div class="card monitor-card">
+            <div class="card-head">
+              <h3>信号</h3>
+              <span id="latency" class="meta"></span>
+            </div>
+            <div class="meters">
+              <div class="meter">
+                <span class="meter-label">输入</span>
+                <div class="meter-track"><div id="meter-in" class="meter-fill"></div></div>
+              </div>
+              <div class="meter">
+                <span class="meter-label">输出</span>
+                <div class="meter-track"><div id="meter-out" class="meter-fill out"></div></div>
+              </div>
+            </div>
+            <canvas id="scope" height="86"></canvas>
+            <p id="mic-status" class="meta dim">麦克风未开启</p>
+          </div>
+
+          <!-- tweak panel -->
+          <div class="card tweak-card">
+            <div class="card-head">
+              <h3>调参面板</h3>
+              <button id="reset" class="btn ghost sm">重置</button>
+            </div>
+            <div class="faders">
+              <div class="fader">
+                <div class="fader-top">
+                  <label for="pitch">音高 <em>Pitch</em></label>
+                  <output id="pitch-val">0.00</output>
+                </div>
+                <input type="range" id="pitch" min="-1" max="1" step="0.01" value="0" />
+                <div class="fader-scale"><span>低沉</span><span>原声</span><span>尖细</span></div>
+                <p id="pitch-note" class="fader-note">±0.0 半音</p>
+              </div>
+              <div class="fader">
+                <div class="fader-top">
+                  <label for="timbre">音色 <em>Timbre</em></label>
+                  <output id="timbre-val">0.00</output>
+                </div>
+                <input type="range" id="timbre" min="-1" max="1" step="0.01" value="0" />
+                <div class="fader-scale"><span>巨人</span><span>原声</span><span>小孩</span></div>
+                <p class="fader-note">共振峰偏移</p>
+              </div>
+              <div class="fader">
+                <div class="fader-top">
+                  <label for="strength">强度 <em>Strength</em></label>
+                  <output id="strength-val">100%</output>
+                </div>
+                <input type="range" id="strength" min="0" max="100" step="1" value="100" />
+                <div class="fader-scale"><span>0%</span><span></span><span>100%</span></div>
+                <p class="fader-note">音色干湿比</p>
+              </div>
+            </div>
+          </div>
+
+          <!-- EQ -->
+          <div class="card eq-card">
+            <div class="card-head">
+              <h3>10 段均衡</h3>
+              <div class="seg" id="eq-stage">
+                <button data-stage="pre" class="on">前级</button><button data-stage="post">后级</button>
+              </div>
+            </div>
+            <div id="eq-bands" class="eq-bands"></div>
+            <button id="eq-flat" class="btn ghost sm">归零</button>
+          </div>
+
+          <!-- file morph -->
+          <div class="card file-card">
+            <div class="card-head">
+              <h3>文件变声</h3>
+              <span class="meta">WAV 输入 → 48 kHz WAV 输出</span>
+            </div>
+            <div id="dropzone" class="dropzone" tabindex="0">
+              <p>拖入音频文件，或 <u>点击选择</u></p>
+              <input id="file-input" type="file" accept="audio/*" hidden />
+            </div>
+            <div id="file-result" class="file-result" hidden>
+              <audio id="result-player" controls></audio>
+              <a id="download" class="btn ghost sm" download="voicemorph.wav">下载 WAV</a>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+    <script type="module" src="./src/main.ts"></script>
+  </body>
+</html>
