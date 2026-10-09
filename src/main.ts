@@ -181,7 +181,28 @@ let running = false;
 let outLevel = 0;
 const scopeBuf = new Float32Array(4800);
 
+// monitorGen invalidates IPC results still in flight across a
+// stop→restart: a stale reply can never land on the new session's node.
+let monitorGen = 0;
+const MAX_INFLIGHT = 8; // bound the serialized processChunk chain
+
+interface RtStats {
+  underruns: number;
+  overruns: number;
+  bufferedMs: number;
+}
+let lastStats: RtStats = { underruns: 0, overruns: 0, bufferedMs: 0 };
+let droppedBlocks = 0; // captured blocks dropped at the chain bound
+
+function showRtStats(s?: RtStats) {
+  if (s) lastStats = s;
+  const el = $("#rt-stats");
+  el.hidden = false;
+  el.textContent = `缓冲 ${lastStats.bufferedMs}ms · 欠载 ${lastStats.underruns} · 丢块 ${droppedBlocks} · 溢出 ${lastStats.overruns}`;
+}
+
 async function startMonitor() {
+  const gen = ++monitorGen;
   ctx = new AudioContext({ sampleRate: 48000, latencyHint: "interactive" });
   await ctx.audioWorklet.addModule(workletUrl);
   stream = await navigator.mediaDevices.getUserMedia({
@@ -194,32 +215,58 @@ async function startMonitor() {
   });
   const src = ctx.createMediaStreamSource(stream);
   node = new AudioWorkletNode(ctx, "duplex", { outputChannelCount: [1] });
+  const thisNode = node;
+  lastStats = { underruns: 0, overruns: 0, bufferedMs: 0 };
+  droppedBlocks = 0;
   // serialize IPC through a promise chain: every captured block is
-  // sent (dropping whole blocks would punch content holes — deleted
-  // syllables — into the morphed stream)
+  // sent unless the engine is falling behind realtime (inFlight bound),
+  // in which case the newest block is dropped — the play-side ring cap
+  // would discard the same audio to keep latency bounded anyway.
   let chain: Promise<void> = Promise.resolve();
-  node.port.onmessage = (e) => {
+  let inFlight = 0;
+  thisNode.port.onmessage = (e) => {
+    if (e.data.stats) {
+      showRtStats(e.data.stats as RtStats);
+      return;
+    }
     const block: Float32Array = e.data.in;
+    if (!block) return;
     feedScope(block);
-    chain = chain.then(async () => {
-      const outB64 = await bridge.processChunk(f32ToB64(block));
-      const out = b64ToF32(outB64);
-      outLevel = rms(out);
-      node?.port.postMessage(out, [out.buffer]);
-    }).catch(() => {}); // keep the chain alive on a failed call
+    if (inFlight >= MAX_INFLIGHT) {
+      droppedBlocks++;
+      showRtStats();
+      return;
+    }
+    inFlight++;
+    chain = chain
+      .then(async () => {
+        if (gen !== monitorGen) return;
+        const outB64 = await bridge.processChunk(f32ToB64(block));
+        if (gen !== monitorGen) return;
+        const out = b64ToF32(outB64);
+        outLevel = rms(out);
+        thisNode.port.postMessage(out, [out.buffer]);
+      })
+      .catch(() => {}) // keep the chain alive on a failed call
+      .finally(() => {
+        inFlight--;
+      });
   };
   src.connect(node);
   node.connect(ctx.destination);
   await bridge.resetStream();
+  showRtStats();
 }
 
 function stopMonitor() {
+  monitorGen++;
   node?.disconnect();
   stream?.getTracks().forEach((t) => t.stop());
   ctx?.close();
   node = undefined;
   stream = undefined;
   ctx = undefined;
+  $("#rt-stats").hidden = true;
 }
 
 function bindMonitor() {

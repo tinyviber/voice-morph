@@ -105,7 +105,13 @@ func (m *Morpher) ProcessFile(wavB64 string) (FileResult, error) {
 	}
 	secs := float64(len(pcm)) / engine.SampleRate
 	t0 := time.Now()
-	out := m.eng.Render(pcm)
+	// Render on a dedicated engine: Render holds the mutex for the whole
+	// clip and rebuilds streaming state at the end, so running it on
+	// m.eng would stall live ProcessChunk calls and wipe the monitor's
+	// buffered stream state.
+	eng := engine.New()
+	eng.SetParams(m.eng.Params())
+	out := eng.Render(pcm)
 	return FileResult{
 		Wav:     base64.StdEncoding.EncodeToString(engine.EncodeWAV(out, engine.SampleRate)),
 		Seconds: secs,
