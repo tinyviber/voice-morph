@@ -1,5 +1,6 @@
 import { bridge, inApp } from "./bridge";
-import { ChunkSender } from "./monitor-queue";
+import { ChunkSender, STALE } from "./monitor-queue";
+import { isCallError } from "mygo-runtime";
 import type { Params, State } from "./mygo";
 const workletUrl = "worklet.js"; // served from public/ beside index.html
 
@@ -206,12 +207,16 @@ function showRtStats(s?: RtStats) {
   // end-to-end queue delay ≈ blocks waiting on the send side + the
   // worklet's play-side ring
   const queueMs = sender.queueMs + lastStats.bufferedMs;
-  el.title = "排队≈发送队列+播放缓冲的延迟估计；丢块=积压丢弃或调用失败；超时=IPC 无响应";
-  el.textContent = `缓冲 ${lastStats.bufferedMs}ms · 排队 ${queueMs}ms · 欠载 ${lastStats.underruns} · 丢块 ${sender.droppedBlocks} · 溢出 ${lastStats.overruns} · 超时 ${sender.ipcTimeouts}`;
+  el.title = "排队≈发送队列+播放缓冲的延迟估计；丢块=积压丢弃或调用失败；超时=IPC 无响应；重同步=超时/被拒后换新流续发";
+  el.textContent = `缓冲 ${lastStats.bufferedMs}ms · 排队 ${queueMs}ms · 欠载 ${lastStats.underruns} · 丢块 ${sender.droppedBlocks} · 溢出 ${lastStats.overruns} · 超时 ${sender.ipcTimeouts} · 重同步 ${sender.resyncs}`;
 }
 
 async function startMonitor() {
   const gen = ++monitorGen;
+  // Claim this monitor's stream base BEFORE any audio flows: the Go side
+  // rebuilds stream state and rejects every chunk still in flight under
+  // an older stream ID, so a dead call can never mutate the new stream.
+  const streamBase = await bridge.resetStream();
   ctx = new AudioContext({ sampleRate: 48000, latencyHint: "interactive" });
   await ctx.audioWorklet.addModule(workletUrl);
   stream = await navigator.mediaDevices.getUserMedia({
@@ -227,13 +232,27 @@ async function startMonitor() {
   const thisNode = node;
   lastStats = { underruns: 0, overruns: 0, bufferedMs: 0 };
   // serialize IPC through an explicit pending FIFO drained one call at a
-  // time; past the bound the OLDEST unsent block is dropped (fresh speech
-  // over stale audio), each call is wrapped in an IPC timeout so a hung
-  // processChunk drops its result instead of stalling the queue forever.
+  // time; every block rides (streamID, seq) — past the bound the OLDEST
+  // unsent block is dropped (fresh speech over stale audio; the Go side
+  // counts the seq hole), and an IPC timeout or a stale rejection resyncs
+  // the sender onto a fresh stream ID instead of feeding a stream whose
+  // tail may already have consumed the abandoned block.
   const sender = new ChunkSender(
     {
       isLive: () => gen === monitorGen,
-      send: (block) => bridge.processChunk(f32ToB64(block)),
+      send: async (streamID, seq, block) => {
+        try {
+          return await bridge.processChunk(streamID, seq, f32ToB64(block));
+        } catch (err) {
+          // Go refused the (stream, seq) pair: translate the protocol
+          // rejection into the sender's resync signal; anything else is
+          // an ordinary IPC failure (drop the block, keep the stream).
+          if (isCallError(err) && err.message.startsWith("voicemorph: stale")) {
+            return STALE;
+          }
+          throw err;
+        }
+      },
       onOutput: (outB64) => {
         const out = b64ToF32(outB64);
         outLevel = rms(out);
@@ -243,6 +262,7 @@ async function startMonitor() {
     },
     MAX_BACKLOG,
     IPC_TIMEOUT_MS,
+    streamBase,
   );
   rtSender = sender;
   thisNode.port.onmessage = (e) => {
@@ -258,7 +278,6 @@ async function startMonitor() {
   };
   src.connect(node);
   node.connect(ctx.destination);
-  await bridge.resetStream();
   showRtStats();
 }
 
@@ -344,7 +363,6 @@ function bindFile() {
   dz.ondragleave = () => dz.classList.remove("drag");
   dz.ondrop = (e) => {
     e.preventDefault();
-    dz.classList.remove("drag");
     const f = e.dataTransfer?.files[0];
     if (f) void morphFile(f);
   };
@@ -431,7 +449,7 @@ function encodeWav16(samples: Float32Array, sr: number): Uint8Array {
   v.setUint32(16, 16, true);
   v.setUint16(20, 1, true);
   v.setUint16(22, 1, true);
-  v.setUint32(24, sr, true);
+  v.setUint16(24, sr, true);
   v.setUint32(28, sr * 2, true);
   v.setUint16(32, 2, true);
   v.setUint16(34, 16, true);

@@ -10,16 +10,17 @@ export interface Bridge {
   getState(): Promise<State>;
   setParams(p: Params): Promise<void>;
   applyPreset(id: string): Promise<Params>;
-  processChunk(pcmB64: string): Promise<string>;
+  processChunk(streamID: number, seq: number, pcmB64: string): Promise<string>;
   processFile(wavB64: string): Promise<FileResult>;
-  resetStream(): Promise<void>;
+  /** issues a new monitor epoch; resolves to that epoch's stream-ID base */
+  resetStream(): Promise<number>;
 }
 
 const real: Bridge = {
   getState: () => Morpher.getState(),
   setParams: (p) => Morpher.setParams(p),
   applyPreset: (id) => Morpher.applyPreset(id),
-  processChunk: (pcm) => Morpher.processChunk(pcm),
+  processChunk: (streamID, seq, pcm) => Morpher.processChunk(streamID, seq, pcm),
   processFile: (wav) => Morpher.processFile(wav),
   resetStream: () => Morpher.resetStream(),
 };
@@ -39,6 +40,8 @@ function zeros(): number[] {
   return new Array(10).fill(0);
 }
 
+let mockEpoch = 0; // pretend stream bases, so restarts look real in preview
+
 const mock: Bridge = {
   getState: async () => ({
     params: { pitch: 0, timbre: 0, strength: 1, gain: 1, bypass: false, eqPre: zeros(), eqPost: zeros() },
@@ -51,9 +54,9 @@ const mock: Bridge = {
   setParams: async () => {},
   applyPreset: async (id) => mockPresets.find((p) => p.id === id)!.params,
   // dry pass-through in the browser preview
-  processChunk: async (pcm) => pcm,
+  processChunk: async (_streamID, _seq, pcm) => pcm,
   processFile: async () => ({ wav: "", seconds: 0, inHz: 48000, outHz: 48000, elapsed: 0 }),
-  resetStream: async () => {},
+  resetStream: async () => ++mockEpoch,
 };
 
 export const bridge: Bridge = isMyGo() ? real : mock;

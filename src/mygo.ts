@@ -67,17 +67,23 @@ export const Morpher = {
   },
   /**
    * ProcessChunk morphs one realtime block: base64 little-endian float32
-   * mono at 48 kHz in, same format out.
+   * mono at 48 kHz in, same format out. The (streamID, seq) pair makes a
+   * reordered or timed-out call a deterministic rejection instead of an
+   * out-of-turn stream-state mutation — see Morpher.ProcessChunk.
    */
-  processChunk(pcm: string): Promise<string> {
-    return call("Morpher.ProcessChunk", pcm);
+  processChunk(streamID: number, seq: number, pcm: string): Promise<string> {
+    return call("Morpher.ProcessChunk", streamID, seq, pcm);
   },
   /** ProcessFile morphs a whole WAV clip offline and returns a 48 kHz WAV. */
   processFile(wavB64: string): Promise<FileResult> {
     return call("Morpher.ProcessFile", wavB64);
   },
-  /** ResetStream clears streaming state (called when monitoring restarts). */
-  resetStream(): Promise<void> {
+  /**
+   * ResetStream begins a monitor epoch: streaming state is rebuilt and
+   * the resolved value is the stream-ID base this monitor's chunks must
+   * carry (base + resync index). Older streams are rejected from then on.
+   */
+  resetStream(): Promise<number> {
     return call("Morpher.ResetStream");
   },
   /** SetParams applies a new parameter set. */
