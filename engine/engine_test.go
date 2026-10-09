@@ -193,9 +193,11 @@ func maxDiff(a, b []float32) float64 {
 
 // Chunked Process + Flush must equal a single Render sample-for-sample:
 // the streaming path is the live-monitor path and any drift is audible.
-// Render additionally shifts output by the measured pipeline onset
-// offset for lip-sync, so the comparison corrects for that shift:
-// render[i] = pipeline[i+off], streamed[p] = pipeline[p].
+// Render internally pre-pads the input (see Render's comment) and
+// shifts output by the measured pipeline onset offset for lip-sync, so
+// the comparison feeds the stream the same padded input and corrects
+// for that shift: render[i] = pipeline[i+pad+off], streamed[p] =
+// pipeline[p].
 func TestStreamingMatchesRender(t *testing.T) {
 	in := sine(200, 0.5, SampleRate)
 	for _, pitch := range []float64{-0.5, 0.5} {
@@ -205,43 +207,50 @@ func TestStreamingMatchesRender(t *testing.T) {
 		e.SetParams(p)
 		full := e.Render(in)
 
+		// replicate Render's pre-pad so the streamed pipeline sees the
+		// identical input
+		prior := morphOffset(math.Pow(2, pitch))
+		pad := renderPad(prior)
+		padded := append(make([]float32, pad), in...)
 		var streamed []float32
 		const chunk = 2048
-		for i := 0; i < len(in); i += chunk {
+		for i := 0; i < len(padded); i += chunk {
 			end := i + chunk
-			if end > len(in) {
-				end = len(in)
+			if end > len(padded) {
+				end = len(padded)
 			}
-			streamed = append(streamed, e.Process(in[i:end])...)
+			streamed = append(streamed, e.Process(padded[i:end])...)
 		}
 		streamed = append(streamed, e.Flush()...)
 
-		if len(streamed) != len(full) {
-			t.Fatalf("pitch %+v: streamed %d samples, render %d", pitch, len(streamed), len(full))
-		}
 		// Render's shift is measured on the signal, so reproduce the
 		// same measurement on the streamed pipeline output
-		xf := make([]float64, len(in))
-		for i, v := range in {
+		xf := make([]float64, len(padded))
+		for i, v := range padded {
 			xf[i] = float64(v)
 		}
 		sf := make([]float64, len(streamed))
 		for i, v := range streamed {
 			sf[i] = float64(v)
 		}
-		off := alignLag(xf, sf, morphOffset(math.Pow(2, pitch)))
-		// compare positions present in both: render[i] = mix[i+off],
-		// except the head-ramp region (i < 6|off|) where a negative
-		// shift deliberately time-squeezes the head instead of
-		// emitting zeros — that region is covered by TestRenderHeadOnset
-		lo, hi := 0, len(in)
-		if off > 0 {
-			lo = off
-		} else {
-			lo, hi = -5*off, len(in)+off
+		off := alignLag(xf, sf, prior)
+		// every output position i reads mix'[i+pad+off]; compare the
+		// positions that exist in the streamed output
+		bad, first := 0, -1
+		for i := 0; i < len(in); i++ {
+			j := i + pad + off
+			if j < 0 || j >= len(streamed) {
+				continue
+			}
+			if math.Abs(float64(full[i]-streamed[j])) > 1e-5 {
+				bad++
+				if first < 0 {
+					first = i
+				}
+			}
 		}
-		if d := maxDiff(streamed[lo:hi], full[lo-off:hi-off]); d > 1e-5 {
-			t.Fatalf("pitch %+v: streamed vs render max|diff| = %g", pitch, d)
+		if bad > 0 {
+			t.Fatalf("pitch %+v: %d mismatched positions (first @%d, off %d)", pitch, bad, first, off)
 		}
 	}
 }
@@ -562,11 +571,71 @@ func burstOnsets(x []float32, thresh float64, refractory int) []int {
 	return onsets
 }
 
+// energy returns the total signal energy Σx².
+func energy(x []float32) float64 {
+	var e float64
+	for _, v := range x {
+		e += float64(v) * float64(v)
+	}
+	return e
+}
+
+// matchOnsets pairs each input onset with exactly one output onset
+// within tol samples via a sorted two-pointer walk — unambiguous while
+// the onset spacing exceeds 2·tol. Returns matched pairs, the input
+// onsets with no output counterpart (dropped content), and the output
+// onsets matched by no input onset (duplicated or spurious content).
+func matchOnsets(inOn, outOn []int, tol int) (matched int, missed, extra []int) {
+	j := 0
+	for _, io := range inOn {
+		for j < len(outOn) && outOn[j] < io-tol {
+			extra = append(extra, outOn[j])
+			j++
+		}
+		if j < len(outOn) && outOn[j] <= io+tol {
+			matched++
+			j++
+		} else {
+			missed = append(missed, io)
+		}
+	}
+	return matched, missed, append(extra, outOn[j:]...)
+}
+
+// assertOnsets1to1 requires every detected input onset to appear
+// exactly once in the output: equal onset counts, a 1:1 match within
+// tol (no onset dropped or replayed ~latency later), total energy
+// conserved within eTol, and output length equal to input length.
+func assertOnsets1to1(t *testing.T, in, out []float32, tol int, eTol float64) {
+	t.Helper()
+	if len(out) != len(in) {
+		t.Errorf("output length %d, want exactly %d", len(out), len(in))
+	}
+	iOn := burstOnsets(in, 0.15, 400)
+	oOn := burstOnsets(out, 0.15, 400)
+	matched, missed, extra := matchOnsets(iOn, oOn, tol)
+	if len(iOn) != len(oOn) {
+		t.Errorf("onset count: %d input vs %d output", len(iOn), len(oOn))
+	}
+	if len(missed) > 0 {
+		t.Errorf("input onsets missing from output at %v (in %v, out %v)", missed, iOn, oOn)
+	}
+	if len(extra) > 0 {
+		t.Errorf("extra output onsets (replayed content) at %v (in %v, out %v)", extra, iOn, oOn)
+	}
+	if matched != len(iOn) {
+		t.Errorf("only %d/%d input onsets matched", matched, len(iOn))
+	}
+	ei, eo := energy(in), energy(out)
+	if eo < ei*(1-eTol) || eo > ei*(1+eTol) {
+		t.Errorf("energy not conserved: %.0f in vs %.0f out (allowed ±%.0f%%)", ei, eo, eTol*100)
+	}
+}
+
 // A mid-stream param change must keep the output timeline aligned:
-// bursts must appear once each — no duplicate onset closer than half
-// the burst spacing (the arrival-aligned fade mixed audio ~latency
-// apart, replaying a burst ~60-130 ms after itself) and no gap longer
-// than ~1.5 spacings.
+// every input burst must appear exactly once — the arrival-aligned
+// fade mixed audio ~latency apart, replaying a burst ~60-130 ms after
+// itself; spacing checks alone would pass a run of dropped bursts.
 func TestCrossfadePositionAligned(t *testing.T) {
 	const hop = 2160 // 45 ms
 	in := burstTrack(700, 0.5, 240, hop, SampleRate)
@@ -576,31 +645,17 @@ func TestCrossfadePositionAligned(t *testing.T) {
 	e.SetParams(p)
 	var out []float32
 	const chunk = 2048
-	for i := 0; i < len(in)/chunk; i++ {
-		if i == 10 {
+	for i := 0; i < len(in); i += chunk {
+		if i == 10*chunk {
 			p.Pitch = 0.5
 			e.SetParams(p)
 		}
-		out = append(out, e.Process(in[i*chunk:(i+1)*chunk])...)
+		end := min(i+chunk, len(in))
+		out = append(out, e.Process(in[i:end])...)
 	}
 	out = append(out, e.Flush()...)
 
-	onsets := burstOnsets(out, 0.15, 400)
-	switchAt := 10 * chunk
-	var post []int
-	for _, o := range onsets {
-		if o > switchAt-2*hop && o < len(out)-2*hop {
-			post = append(post, o)
-		}
-	}
-	for i := 1; i < len(post); i++ {
-		if d := post[i] - post[i-1]; d < hop/2 {
-			t.Errorf("duplicated burst: onsets at %d and %d (%.1f ms apart)", post[i-1], post[i], float64(d)/48)
-		} else if d > 3*hop/2 {
-			t.Errorf("swallowed burst: onset gap %d→%d (%.1f ms)", post[i-1], post[i], float64(d)/48)
-		}
-	}
-	t.Logf("onsets post-switch: %v", post)
+	assertOnsets1to1(t, in, out, 960, 0.5)
 }
 
 // Repeatedly flipping params mid-stream must not stall output or
@@ -614,15 +669,17 @@ func TestRepeatedSwitchStability(t *testing.T) {
 	var out []float32
 	var blockLen []int
 	const chunk = 2048
-	for i := 0; i < len(in)/chunk; i++ {
-		if i%4 == 0 {
+	for i := 0; i < len(in); i += chunk {
+		b := i / chunk
+		if b%4 == 0 {
 			p.Pitch = -p.Pitch - 0.4 // alternate ≈ -0.4 / +0.0
-			if i == 0 {
+			if b == 0 {
 				p.Pitch = -0.4
 			}
 			e.SetParams(p)
 		}
-		o := e.Process(in[i*chunk : (i+1)*chunk])
+		end := min(i+chunk, len(in))
+		o := e.Process(in[i:end])
 		blockLen = append(blockLen, len(o))
 		out = append(out, o...)
 	}
@@ -632,12 +689,7 @@ func TestRepeatedSwitchStability(t *testing.T) {
 			t.Fatalf("block %d stalled: %d samples", i, blockLen[i])
 		}
 	}
-	onsets := burstOnsets(out, 0.15, 400)
-	for i := 1; i < len(onsets); i++ {
-		if d := onsets[i] - onsets[i-1]; d < hop/2 {
-			t.Fatalf("duplicated burst under repeated switching: onsets %d, %d", onsets[i-1], onsets[i])
-		}
-	}
+	assertOnsets1to1(t, in, out, 960, 0.6)
 }
 
 // Toggling bypass mid-stream must blend dry↔wet instead of clicking.
@@ -675,6 +727,37 @@ func TestBypassContinuity(t *testing.T) {
 	if math.Abs(float64(len(out))/float64(len(in))-1) > 0.05 {
 		t.Fatalf("bypass stream lost content: %d vs %d", len(out), len(in))
 	}
+}
+
+// Toggling bypass mid-stream with the morph section active must keep
+// the output timeline aligned on the dry side too: the wet path runs
+// ~100 ms of pipeline latency, so pairing wet and raw dry by arrival
+// order skips ~latency of content on bypass-on and replays it on
+// bypass-off. With position alignment every input burst must appear
+// exactly once.
+func TestBypassPositionAligned(t *testing.T) {
+	const hop = 2160
+	in := burstTrack(700, 0.5, 240, hop, SampleRate)
+	e := New()
+	p := DefaultParams
+	p.Pitch = 0.5
+	e.SetParams(p)
+	var out []float32
+	const chunk = 2048
+	for i := 0; i < len(in); i += chunk {
+		if i == 12*chunk {
+			p.Bypass = true
+			e.SetParams(p)
+		}
+		if i == 20*chunk {
+			p.Bypass = false
+			e.SetParams(p)
+		}
+		end := min(i+chunk, len(in))
+		out = append(out, e.Process(in[i:end])...)
+	}
+	out = append(out, e.Flush()...)
+	assertOnsets1to1(t, in, out, 960, 0.5)
 }
 
 // Render must be lip-synced for dubbing: exactly len(in) samples, and
@@ -757,6 +840,57 @@ func TestRenderHeadOnset(t *testing.T) {
 			t.Errorf("pitch %+v: %d leading zeros (%.1f ms), want ≤ ~10 ms",
 				pitch, zeros, float64(zeros)/48)
 		}
+	}
+}
+
+// f0Seg estimates the fundamental of a segment by autocorrelation over
+// lag [lo, hi] samples — unlike estimateF0 it does not skip a warm-up
+// region, so a segment's head is measured too.
+func f0Seg(x []float32, lo, hi int) float64 {
+	var energy float64
+	for _, v := range x {
+		energy += float64(v) * float64(v)
+	}
+	if energy < 1e-9 {
+		return 0
+	}
+	bestLag, bestV := 0, -1.0
+	for lag := lo; lag <= hi; lag++ {
+		var c float64
+		for i := 0; i+lag < len(x); i++ {
+			c += float64(x[i]) * float64(x[i+lag])
+		}
+		if c/energy > bestV {
+			bestV, bestLag = c/energy, lag
+		}
+	}
+	if bestLag == 0 {
+		return 0
+	}
+	return float64(SampleRate) / float64(bestLag)
+}
+
+// A clip that starts with voiced content must keep its head's pitch
+// intact: at pitch +1 the measured offset is negative, and the old
+// monotone head ramp time-squeezed the first ~168 ms by ~5/6 (≈−3.2
+// semitones). With input pre-padding the head plays at full rate.
+func TestRenderHeadPitch(t *testing.T) {
+	in := vowel(120, 900, 1.0) // harmonic comb starting at sample 0
+	e := New()
+	p := DefaultParams
+	p.Pitch = 1
+	e.SetParams(p)
+	out := e.Render(in)
+	const n = SampleRate / 5 // 200 ms windows
+	head := f0Seg(out[:n], SampleRate/500, SampleRate/80)
+	mid := f0Seg(out[len(out)/2-n/2:len(out)/2+n/2], SampleRate/500, SampleRate/80)
+	want := 240.0
+	if math.Abs(mid-want)/want > 0.05 {
+		t.Fatalf("mid f0 = %.1f Hz, want ~%.0f", mid, want)
+	}
+	if math.Abs(head-mid)/mid > 0.08 {
+		t.Errorf("head f0 = %.1f Hz vs mid %.1f Hz (%.0f%% off) — head distorted",
+			head, mid, math.Abs(head/mid-1)*100)
 	}
 }
 

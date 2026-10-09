@@ -514,32 +514,35 @@ func abs(x int) int {
 	return x
 }
 
-// shiftIndex maps an output position to the pipeline index Render reads.
-// A negative offset (the pipeline leaks onsets forward) would zero-fill
-// the first |off| samples and lose the clip's head — but the stream's
-// first emitted output inherently covers input ~0. So the applied shift
-// ramps linearly 0→off over ~6|off| positions: a monotone map that
-// time-squeezes the head gently (j ≈ 5i/6) instead of replacing it with
-// silence or replaying a slice of it (a hard join would echo ~28 ms).
-func shiftIndex(i, off int) int {
-	if off >= 0 || i >= -6*off {
-		return i + off
+// renderPad returns the input pre-padding Render applies: enough to
+// keep |off| inside the emitted range for any negative measured off
+// (the alignLag window's lower bound, ~prior-984, plus a guard).
+func renderPad(prior int) int {
+	if pad := 984 - prior + 240; pad > 0 {
+		return pad
 	}
-	return i + off*i/(-6*off)
+	return 0
 }
 
 // Render processes a whole clip offline, flushing every stage's tail.
 // The result is lip-synced: it is shifted back by the measured pipeline
 // onset offset and always returns exactly len(in) samples (the residual
-// tail is trimmed, a short tail is zero-padded).
+// tail is trimmed, a short tail is zero-padded). When the offset is
+// negative the pipeline leaks onsets forward — head content would land
+// before index 0 and be lost — so the input is pre-padded by more than
+// the worst case |off|: early content lands inside the padded headroom
+// and one linear index map recovers it, with no time-squeeze on the
+// head.
 func (e *Engine) Render(in []float32) []float32 {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	out := make([]float32, len(in))
 	if !e.params.Bypass {
-		x := make([]float64, len(in))
+		prior := morphOffset(e.pitchR)
+		pad := renderPad(prior)
+		x := make([]float64, len(in)+pad)
 		for i, v := range in {
-			x[i] = float64(v)
+			x[i+pad] = float64(v)
 		}
 		x = e.pre.Process(x)
 		// a render is self-contained: discard any transition in flight
@@ -564,8 +567,7 @@ func (e *Engine) Render(in []float32) []float32 {
 			off = alignLag(x, mix, morphOffset(e.pitchR))
 		}
 		for i := range out {
-			j := shiftIndex(i, off)
-			if j >= 0 && j < len(mix) {
+			if j := i + pad + off; j >= 0 && j < len(mix) {
 				out[i] = float32(mix[j])
 			}
 		}
