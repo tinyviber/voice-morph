@@ -1,4 +1,5 @@
 import { bridge, inApp } from "./bridge";
+import { ChunkSender } from "./monitor-queue";
 import type { Params, State } from "./mygo";
 const workletUrl = "worklet.js"; // served from public/ beside index.html
 
@@ -182,9 +183,12 @@ let outLevel = 0;
 const scopeBuf = new Float32Array(4800);
 
 // monitorGen invalidates IPC results still in flight across a
-// stop→restart: a stale reply can never land on the new session's node.
+// stop→restart: a stale reply (including a timed-out call resolving
+// late) can never land on the new session's node.
 let monitorGen = 0;
-const MAX_INFLIGHT = 8; // bound the serialized processChunk chain
+const MAX_BACKLOG = 8; // queued + in-flight blocks before drop-oldest
+const IPC_TIMEOUT_MS = 1800; // ≫ engine latency (~110ms): one hung processChunk must never stall the queue
+let rtSender: ChunkSender | undefined;
 
 interface RtStats {
   underruns: number;
@@ -192,13 +196,18 @@ interface RtStats {
   bufferedMs: number;
 }
 let lastStats: RtStats = { underruns: 0, overruns: 0, bufferedMs: 0 };
-let droppedBlocks = 0; // captured blocks dropped at the chain bound
 
 function showRtStats(s?: RtStats) {
+  const sender = rtSender;
+  if (!sender) return; // stopped (or strays from a dead generation)
   if (s) lastStats = s;
   const el = $("#rt-stats");
   el.hidden = false;
-  el.textContent = `缓冲 ${lastStats.bufferedMs}ms · 欠载 ${lastStats.underruns} · 丢块 ${droppedBlocks} · 溢出 ${lastStats.overruns}`;
+  // end-to-end queue delay ≈ blocks waiting on the send side + the
+  // worklet's play-side ring
+  const queueMs = sender.queueMs + lastStats.bufferedMs;
+  el.title = "排队≈发送队列+播放缓冲的延迟估计；丢块=积压丢弃或调用失败；超时=IPC 无响应";
+  el.textContent = `缓冲 ${lastStats.bufferedMs}ms · 排队 ${queueMs}ms · 欠载 ${lastStats.underruns} · 丢块 ${sender.droppedBlocks} · 溢出 ${lastStats.overruns} · 超时 ${sender.ipcTimeouts}`;
 }
 
 async function startMonitor() {
@@ -217,13 +226,25 @@ async function startMonitor() {
   node = new AudioWorkletNode(ctx, "duplex", { outputChannelCount: [1] });
   const thisNode = node;
   lastStats = { underruns: 0, overruns: 0, bufferedMs: 0 };
-  droppedBlocks = 0;
-  // serialize IPC through a promise chain: every captured block is
-  // sent unless the engine is falling behind realtime (inFlight bound),
-  // in which case the newest block is dropped — the play-side ring cap
-  // would discard the same audio to keep latency bounded anyway.
-  let chain: Promise<void> = Promise.resolve();
-  let inFlight = 0;
+  // serialize IPC through an explicit pending FIFO drained one call at a
+  // time; past the bound the OLDEST unsent block is dropped (fresh speech
+  // over stale audio), each call is wrapped in an IPC timeout so a hung
+  // processChunk drops its result instead of stalling the queue forever.
+  const sender = new ChunkSender(
+    {
+      isLive: () => gen === monitorGen,
+      send: (block) => bridge.processChunk(f32ToB64(block)),
+      onOutput: (outB64) => {
+        const out = b64ToF32(outB64);
+        outLevel = rms(out);
+        thisNode.port.postMessage(out, [out.buffer]);
+      },
+      onCounts: () => showRtStats(),
+    },
+    MAX_BACKLOG,
+    IPC_TIMEOUT_MS,
+  );
+  rtSender = sender;
   thisNode.port.onmessage = (e) => {
     if (e.data.stats) {
       showRtStats(e.data.stats as RtStats);
@@ -232,25 +253,8 @@ async function startMonitor() {
     const block: Float32Array = e.data.in;
     if (!block) return;
     feedScope(block);
-    if (inFlight >= MAX_INFLIGHT) {
-      droppedBlocks++;
-      showRtStats();
-      return;
-    }
-    inFlight++;
-    chain = chain
-      .then(async () => {
-        if (gen !== monitorGen) return;
-        const outB64 = await bridge.processChunk(f32ToB64(block));
-        if (gen !== monitorGen) return;
-        const out = b64ToF32(outB64);
-        outLevel = rms(out);
-        thisNode.port.postMessage(out, [out.buffer]);
-      })
-      .catch(() => {}) // keep the chain alive on a failed call
-      .finally(() => {
-        inFlight--;
-      });
+    sender.push(block);
+    showRtStats();
   };
   src.connect(node);
   node.connect(ctx.destination);
@@ -259,7 +263,8 @@ async function startMonitor() {
 }
 
 function stopMonitor() {
-  monitorGen++;
+  monitorGen++; // kill the sender's isLive(): queued + in-flight work dies
+  rtSender = undefined;
   node?.disconnect();
   stream?.getTracks().forEach((t) => t.stop());
   ctx?.close();
