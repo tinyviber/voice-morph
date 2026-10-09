@@ -219,12 +219,26 @@ func TestStreamingMatchesRender(t *testing.T) {
 		if len(streamed) != len(full) {
 			t.Fatalf("pitch %+v: streamed %d samples, render %d", pitch, len(streamed), len(full))
 		}
-		off := morphOffset(math.Pow(2, pitch))
-		lo, hi := 0, len(in) // pipeline positions present in both
+		// Render's shift is measured on the signal, so reproduce the
+		// same measurement on the streamed pipeline output
+		xf := make([]float64, len(in))
+		for i, v := range in {
+			xf[i] = float64(v)
+		}
+		sf := make([]float64, len(streamed))
+		for i, v := range streamed {
+			sf[i] = float64(v)
+		}
+		off := alignLag(xf, sf, morphOffset(math.Pow(2, pitch)))
+		// compare positions present in both: render[i] = mix[i+off],
+		// except the head-ramp region (i < 6|off|) where a negative
+		// shift deliberately time-squeezes the head instead of
+		// emitting zeros — that region is covered by TestRenderHeadOnset
+		lo, hi := 0, len(in)
 		if off > 0 {
 			lo = off
 		} else {
-			hi = len(in) + off
+			lo, hi = -5*off, len(in)+off
 		}
 		if d := maxDiff(streamed[lo:hi], full[lo-off:hi-off]); d > 1e-5 {
 			t.Fatalf("pitch %+v: streamed vs render max|diff| = %g", pitch, d)
@@ -398,15 +412,18 @@ func TestPitchTimbreOrthogonal(t *testing.T) {
 		t.Fatalf("vowel envelope peak at %.0f Hz, want ~900", base)
 	}
 	for _, pitch := range []float64{-0.5, 0.5} {
-		e := New()
-		p := DefaultParams
-		p.Pitch = pitch
-		e.SetParams(p)
-		out := e.Render(in)
-		got := bandEnvelopePeak(out, SampleRate)
-		if math.Abs(got/base-1) > 0.10 {
-			t.Errorf("pitch %+v timbre 0: envelope peak %.0f→%.0f Hz (%.0f%%), want ±10%%",
-				pitch, base, got, (got/base-1)*100)
+		for _, s := range []float64{0, 0.5, 1} {
+			e := New()
+			p := DefaultParams
+			p.Pitch = pitch
+			p.Strength = s
+			e.SetParams(p)
+			out := e.Render(in)
+			got := bandEnvelopePeak(out, SampleRate)
+			if math.Abs(got/base-1) > 0.10 {
+				t.Errorf("pitch %+v timbre 0 strength %v: envelope peak %.0f→%.0f Hz (%.0f%%), want ±10%%",
+					pitch, s, base, got, (got/base-1)*100)
+			}
 		}
 	}
 	// timbre direction: a 1200 Hz resonance tracks the warp cleanly —
@@ -425,6 +442,19 @@ func TestPitchTimbreOrthogonal(t *testing.T) {
 			t.Errorf("timbre %+v pitch 0: envelope peak %.0f→%.0f Hz, want ~%.0f",
 				tim, base2, got, want)
 		}
+	}
+	// strength scales the timbre warp: timbre 0.4 at strength 0.5 must
+	// move the envelope by 2^0.2, not 2^0.4
+	e := New()
+	p := DefaultParams
+	p.Timbre = 0.4
+	p.Strength = 0.5
+	e.SetParams(p)
+	got := bandEnvelopePeak(e.Render(in2), SampleRate)
+	want := base2 * math.Pow(2, 0.2)
+	if math.Abs(got/want-1) > 0.10 {
+		t.Errorf("timbre 0.4 strength 0.5: envelope peak %.0f→%.0f Hz, want ~%.0f",
+			base2, got, want)
 	}
 }
 
@@ -484,6 +514,129 @@ func TestSetParamsContinuity(t *testing.T) {
 	if math.Abs(float64(len(out))/float64(len(in))-1) > 0.05 {
 		t.Fatalf("streamed+flushed %d samples vs input %d (%.1f%% off)",
 			len(out), len(in), (float64(len(out))/float64(len(in))-1)*100)
+	}
+}
+
+// burstTrack synthesizes short Hann-windowed tone bursts every hop
+// samples — the worst case for a misaligned param-change fade: a
+// doubled or swallowed onset is directly audible.
+func burstTrack(freq, amp float64, burstLen, hop, n int) []float32 {
+	x := make([]float32, n)
+	for b := 0; b*hop+burstLen < n; b++ {
+		for i := 0; i < burstLen; i++ {
+			w := 0.5 - 0.5*math.Cos(2*math.Pi*float64(i)/float64(burstLen))
+			x[b*hop+i] += float32(amp * w * math.Sin(2*math.Pi*freq*float64(i)/SampleRate))
+		}
+	}
+	return x
+}
+
+// burstOnsets returns positions where the ~1 ms smoothed energy
+// envelope rises over thresh·max, deduplicated within refractory
+// samples.
+func burstOnsets(x []float32, thresh float64, refractory int) []int {
+	const w = 48
+	env := make([]float64, len(x))
+	var acc float64
+	for i, v := range x {
+		acc += math.Abs(float64(v))
+		if i >= w {
+			acc -= math.Abs(float64(x[i-w]))
+		}
+		env[i] = acc
+	}
+	mx := 0.0
+	for _, e := range env {
+		if e > mx {
+			mx = e
+		}
+	}
+	var onsets []int
+	for i := 1; i < len(env); i++ {
+		if env[i] > thresh*mx && env[i-1] <= thresh*mx {
+			if len(onsets) == 0 || i-onsets[len(onsets)-1] > refractory {
+				onsets = append(onsets, i)
+			}
+		}
+	}
+	return onsets
+}
+
+// A mid-stream param change must keep the output timeline aligned:
+// bursts must appear once each — no duplicate onset closer than half
+// the burst spacing (the arrival-aligned fade mixed audio ~latency
+// apart, replaying a burst ~60-130 ms after itself) and no gap longer
+// than ~1.5 spacings.
+func TestCrossfadePositionAligned(t *testing.T) {
+	const hop = 2160 // 45 ms
+	in := burstTrack(700, 0.5, 240, hop, SampleRate)
+	e := New()
+	p := DefaultParams
+	p.Pitch = -0.3
+	e.SetParams(p)
+	var out []float32
+	const chunk = 2048
+	for i := 0; i < len(in)/chunk; i++ {
+		if i == 10 {
+			p.Pitch = 0.5
+			e.SetParams(p)
+		}
+		out = append(out, e.Process(in[i*chunk:(i+1)*chunk])...)
+	}
+	out = append(out, e.Flush()...)
+
+	onsets := burstOnsets(out, 0.15, 400)
+	switchAt := 10 * chunk
+	var post []int
+	for _, o := range onsets {
+		if o > switchAt-2*hop && o < len(out)-2*hop {
+			post = append(post, o)
+		}
+	}
+	for i := 1; i < len(post); i++ {
+		if d := post[i] - post[i-1]; d < hop/2 {
+			t.Errorf("duplicated burst: onsets at %d and %d (%.1f ms apart)", post[i-1], post[i], float64(d)/48)
+		} else if d > 3*hop/2 {
+			t.Errorf("swallowed burst: onset gap %d→%d (%.1f ms)", post[i-1], post[i], float64(d)/48)
+		}
+	}
+	t.Logf("onsets post-switch: %v", post)
+}
+
+// Repeatedly flipping params mid-stream must not stall output or
+// duplicate bursts — the fade bookkeeping must survive overlapping
+// transitions.
+func TestRepeatedSwitchStability(t *testing.T) {
+	const hop = 2160
+	in := burstTrack(700, 0.5, 240, hop, SampleRate)
+	e := New()
+	p := DefaultParams
+	var out []float32
+	var blockLen []int
+	const chunk = 2048
+	for i := 0; i < len(in)/chunk; i++ {
+		if i%4 == 0 {
+			p.Pitch = -p.Pitch - 0.4 // alternate ≈ -0.4 / +0.0
+			if i == 0 {
+				p.Pitch = -0.4
+			}
+			e.SetParams(p)
+		}
+		o := e.Process(in[i*chunk : (i+1)*chunk])
+		blockLen = append(blockLen, len(o))
+		out = append(out, o...)
+	}
+	out = append(out, e.Flush()...)
+	for i := 6; i < len(blockLen); i++ {
+		if blockLen[i] < 512 {
+			t.Fatalf("block %d stalled: %d samples", i, blockLen[i])
+		}
+	}
+	onsets := burstOnsets(out, 0.15, 400)
+	for i := 1; i < len(onsets); i++ {
+		if d := onsets[i] - onsets[i-1]; d < hop/2 {
+			t.Fatalf("duplicated burst under repeated switching: onsets %d, %d", onsets[i-1], onsets[i])
+		}
 	}
 }
 
@@ -557,6 +710,86 @@ func TestRenderLipSync(t *testing.T) {
 		if off := onset - ns; off < -960 || off > 960 {
 			t.Errorf("pitch %+v: onset offset %+d samples (%.1f ms), want |.| ≤ 20 ms",
 				pitch, off, float64(off)/48)
+		}
+	}
+}
+
+// A clip that starts with sound must keep its head: at r=2 the fitted
+// offset is negative and a blind shift would emit ~28 ms of leading
+// zeros. The measured alignment must place the onset within ±20 ms.
+func TestRenderHeadOnset(t *testing.T) {
+	in := sine(300, 0.5, SampleRate) // tone starts at sample 0
+	for _, pitch := range []float64{0.5, 1} {
+		e := New()
+		p := DefaultParams
+		p.Pitch = pitch
+		e.SetParams(p)
+		out := e.Render(in)
+		mx := 0.0
+		for _, v := range out {
+			if math.Abs(float64(v)) > mx {
+				mx = math.Abs(float64(v))
+			}
+		}
+		onset := -1
+		for i, v := range out {
+			if math.Abs(float64(v)) > 0.05*mx {
+				onset = i
+				break
+			}
+		}
+		if onset < 0 || onset > 960 {
+			t.Errorf("pitch %+v: head onset at %d (%.1f ms), want ≤ 20 ms",
+				pitch, onset, float64(onset)/48)
+		}
+		// leading run of essentially-zero output must not exceed the
+		// morph's own startup noise (~400 samples ≈ 8 ms) by more than
+		// ~2 ms
+		zeros := 0
+		for _, v := range out {
+			if math.Abs(float64(v)) < 1e-3 {
+				zeros++
+			} else {
+				break
+			}
+		}
+		if zeros > 512 {
+			t.Errorf("pitch %+v: %d leading zeros (%.1f ms), want ≤ ~10 ms",
+				pitch, zeros, float64(zeros)/48)
+		}
+	}
+}
+
+// Local alignment, not just global: bursts at three positions must each
+// land within ±20 ms of their input position.
+func TestRenderLocalAlignment(t *testing.T) {
+	positions := []int{SampleRate / 4, SampleRate / 2, 3 * SampleRate / 4}
+	for _, pitch := range []float64{-0.5, 0.5, 1} {
+		in := make([]float32, SampleRate)
+		for _, pos := range positions {
+			for i := 0; i < 960; i++ {
+				w := 0.5 - 0.5*math.Cos(2*math.Pi*float64(i)/960)
+				in[pos+i] += float32(0.5 * w * math.Sin(2*math.Pi*700*float64(i)/SampleRate))
+			}
+		}
+		e := New()
+		p := DefaultParams
+		p.Pitch = pitch
+		e.SetParams(p)
+		out := e.Render(in)
+		onsets := burstOnsets(out, 0.15, 400)
+		for _, pos := range positions {
+			ok := false
+			for _, o := range onsets {
+				if d := o - pos; d > -960 && d < 960 {
+					ok = true
+					break
+				}
+			}
+			if !ok {
+				t.Errorf("pitch %+v: no output onset within ±20 ms of input burst at %d (onsets %v)",
+					pitch, pos, onsets)
+			}
 		}
 	}
 }

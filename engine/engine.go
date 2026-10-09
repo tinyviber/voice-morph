@@ -20,9 +20,11 @@ import (
 const SampleRate = 48000
 
 // morphFadeLen is the crossfade length in samples (~30 ms) used when the
-// morph chain is rebuilt or the bypass is toggled. It is measured in the
-// new side's emitted output: the old side covers the new chain's
-// lookahead (~60-130 ms) before the fade starts counting.
+// morph chain is rebuilt or the bypass is toggled. For the morph-side
+// fade it is measured in output positions the new side covers: the old
+// side keeps covering the stream during the new chain's lookahead
+// (~60-130 ms) and blending only starts where both sides cover the
+// same input position.
 const morphFadeLen = 1440
 
 // Params mirrors the MorphVOX Tweak Panel: pitch and timbre in ±1 units,
@@ -68,6 +70,10 @@ func (c *morphChain) flush() []float64 {
 type side struct {
 	chain *morphChain
 	q     []float64 // emitted output not yet consumed by the fader
+	pos   int       // absolute input position covered by q[0]; both
+	// chains preserve the input timeline 1:1, so pos advances exactly
+	// as the fader consumes samples — for a chain created at input
+	// index S its first emitted sample covers ≈S
 }
 
 func (s *side) push(x []float64) {
@@ -132,14 +138,15 @@ func (e *Engine) setParamsLocked(p Params) {
 			if e.prev != nil && e.fade == 0 {
 				// A transition was already in flight and cur never
 				// produced output: keep the covering side alive,
-				// drop the in-between that never spoke (a hole is
-				// worse than retiring it early).
+				// drop the in-between side outright — everything it
+				// could still emit is redundant with the side that is
+				// actually speaking.
 			} else {
 				e.prev = e.cur
 			}
 			e.fade = 0
 		}
-		e.cur = &side{chain: nc}
+		e.cur = &side{chain: nc, pos: e.inPos}
 		e.pitchR, e.timbreW, e.strength = r, w, p.Strength
 	}
 	if p.Bypass != e.params.Bypass {
@@ -149,17 +156,20 @@ func (e *Engine) setParamsLocked(p Params) {
 }
 
 // newChainLocked builds the morph chain for r/w/strength, or nil when
-// the morph section is neutral. The formant warp is w/r: resampling by
-// r scales formants by r too, so warping back by 1/r leaves the net
-// formant shift at exactly w — pitch no longer drags timbre with it.
+// the morph section is neutral. The user-facing timbre warp is
+// w^strength (strength scales the effect, not the correctness): the
+// formant stage is fed w^strength/r at full strength — resampling by r
+// scales formants by r too, so warping back by exactly 1/r leaves the
+// net formant shift at w^strength and pitch never drags timbre with it.
 func (e *Engine) newChainLocked(r, w, strength float64) *morphChain {
-	if r == 1 && w == 1 {
+	we := math.Pow(w, strength) // effective warp = 2^(timbre*strength)
+	if r == 1 && we == 1 {
 		return nil
 	}
 	return &morphChain{
 		res:  NewResampler(1 / r),                      // shrink duration by r
 		wso:  NewWSOLA(1/r, 2048, 512, 256, int(e.sr)), // stretch back by r
-		form: NewFormant(w/r, strength, int(e.sr)),
+		form: NewFormant(we/r, 1, int(e.sr)),           // pitch compensation at full strength
 	}
 }
 
@@ -183,12 +193,12 @@ func (e *Engine) rebuildLocked() {
 	e.post = NewEQ(e.params.EqPost, e.sr)
 	r := math.Pow(2, e.params.Pitch)
 	w := math.Pow(2, e.params.Timbre)
-	e.cur = &side{chain: e.newChainLocked(r, w, e.params.Strength)}
+	e.inPos, e.outPos = 0, 0
+	e.cur = &side{chain: e.newChainLocked(r, w, e.params.Strength), pos: 0}
 	e.prev = nil
 	e.fade = 0
 	e.bFading, e.bFade, e.bPrevQ = false, 0, nil
 	e.pitchR, e.timbreW, e.strength = r, w, e.params.Strength
-	e.inPos, e.outPos = 0, 0
 }
 
 // morphActive reports whether the pitch/timbre section does any work.
@@ -197,23 +207,95 @@ func (e *Engine) morphActive() bool {
 }
 
 // drainMorph emits the morph section's blended output for this block.
-// While a transition runs, pairs of old/new emissions are linearly
-// crossfaded over morphFadeLen of the new side's output; before the new
-// chain produces anything the old side alone covers the stream, so a
-// parameter change never drops output.
+// While a transition runs, output positions are filled by the side that
+// covers them: positions only prev covers (pre-switch content, or the
+// new chain's warmup window) take prev raw, positions both sides cover
+// blend linearly over morphFadeLen, and positions past the fade take
+// cur raw. Coverage is keyed by absolute input position — cur samples
+// covering already-emitted positions are stale duplicates and dropped,
+// so the blend can never replay content ~latency later.
 func (e *Engine) drainMorph() []float64 {
 	cur := e.cur.q
 	e.cur.q = nil
+	if e.prev == nil {
+		e.cur.pos += len(cur)
+		return cur
+	}
+	emit := e.outPos // next output position to fill
 	var out []float64
-	if e.prev != nil {
-		var used int
-		out, used = mixPair(&e.prev.q, cur, &e.fade)
-		cur = cur[used:]
+	// drop stale coverage: prev kept speaking while cur warmed up, so
+	// the head of either queue may cover positions already emitted
+	e.prev.pos += dropHead(&e.prev.q, emit-e.prev.pos)
+	c0 := 0 // first unconsumed index in cur
+	if d := emit - e.cur.pos; d > 0 {
+		c0 = min(d, len(cur))
+		e.cur.pos += c0
+	}
+	for {
 		if e.fade >= morphFadeLen {
 			e.prev = nil // fade done: retire the old side and its tail
+			break
 		}
+		pi, ci := emit-e.prev.pos, emit-e.cur.pos+c0
+		hasP := pi >= 0 && pi < len(e.prev.q)
+		hasC := ci >= c0 && ci < len(cur)
+		if !hasP && !hasC {
+			break // neither side covers emit yet — resume next block
+		}
+		switch {
+		case hasP && hasC:
+			a := float64(e.fade) / morphFadeLen
+			out = append(out, e.prev.q[pi]*(1-a)+cur[ci]*a)
+			e.fade++
+		case hasP:
+			// cur does not cover emit yet: emit prev raw, and do not
+			// spend fade window — it is measured in cur-covered
+			// positions, not elapsed output
+			out = append(out, e.prev.q[pi])
+		default:
+			out = append(out, cur[ci])
+			e.fade++
+		}
+		emit++
 	}
-	return append(out, cur...)
+	if e.prev == nil {
+		// transition over: everything cur still covers emits raw; its
+		// coverage is contiguous from emit once it spoke
+		if keep := emit - e.cur.pos + c0; keep < len(cur) {
+			if keep > c0 {
+				out = append(out, cur[keep:]...)
+			}
+		}
+		e.cur.pos += len(cur) - c0
+		e.cur.q = nil
+	} else {
+		// transition still running: carry un-emitted coverage (with
+		// positions) into the next block
+		keep := emit - e.cur.pos + c0
+		if keep < c0 {
+			keep = c0
+		}
+		if keep > len(cur) {
+			keep = len(cur)
+		}
+		e.cur.q = cur[keep:]
+		e.cur.pos += keep - c0
+		e.prev.pos += dropHead(&e.prev.q, emit-e.prev.pos)
+	}
+	return out
+}
+
+// dropHead removes up to n samples from the head of a queue and returns
+// how many were dropped.
+func dropHead(q *[]float64, n int) int {
+	if n > len(*q) {
+		n = len(*q)
+	}
+	if n < 0 {
+		n = 0
+	}
+	*q = (*q)[n:]
+	return n
 }
 
 // mixPair drains pending prev output against this block's cur output.
@@ -310,13 +392,6 @@ func (e *Engine) Flush() []float32 {
 			e.cur.q = append(e.cur.q, e.cur.chain.flush()...)
 		}
 		mix := e.drainMorph()
-		if e.prev != nil && len(e.prev.q) > 0 {
-			// fade still unfinished at end of stream: the old side's
-			// tail covers earlier positions than the new side's, so
-			// emit it first
-			mix = append(mix, e.prev.q...)
-			mix = append(mix, e.cur.q...)
-		}
 		mix = e.post.Process(mix)
 		g := e.params.Gain
 		out = make([]float64, len(mix))
@@ -359,6 +434,100 @@ func morphOffset(r float64) int {
 	return int(240 - 1584*(r-1))
 }
 
+// envSeries returns |x| boxcar-smoothed over win samples and subsampled
+// by hop — a ~1 kHz energy envelope for onset alignment.
+func envSeries(x []float64, win, hop int) []float64 {
+	n := len(x) / hop
+	if n == 0 {
+		return nil
+	}
+	env := make([]float64, n)
+	var acc float64
+	j := 0
+	for i, v := range x {
+		acc += math.Abs(v)
+		if i >= win {
+			acc -= math.Abs(x[i-win])
+		}
+		if i%hop == hop-1 && j < n {
+			env[j] = acc
+			j++
+		}
+	}
+	return env
+}
+
+// alignLag measures the pipeline's onset offset: the lag within
+// ±960 samples of prior at which the input's energy envelope best
+// matches the pipeline output's. Degenerate inputs (silence, flat
+// envelopes) fall back to the fitted constant.
+func alignLag(xIn, mix []float64, prior int) int {
+	const hop = 24 // 0.5 ms at 48 kHz
+	ei, eo := envSeries(xIn, 2*hop, hop), envSeries(mix, 2*hop, hop)
+	var ei2, eo2 float64
+	for _, v := range ei {
+		ei2 += v * v
+	}
+	for _, v := range eo {
+		eo2 += v * v
+	}
+	if ei2 < 1e-9 || eo2 < 1e-9 {
+		return prior // silence: nothing to align
+	}
+	lo, hi := (prior-960)/hop-1, (prior+960)/hop+1
+	bestL, bestC := prior/hop, -1.0
+	for l := lo; l <= hi; l++ {
+		var c float64
+		for i := 0; i < len(ei); i++ {
+			if j := i + l; j >= 0 && j < len(eo) {
+				c += ei[i] * eo[j]
+			}
+		}
+		if c > bestC {
+			bestC, bestL = c, l
+		}
+	}
+	if bestC <= 0 {
+		return prior
+	}
+	// ambiguous scores (flat regions, periodic content): prefer the
+	// lag closest to the fitted constant
+	pick := bestL
+	for l := lo; l <= hi; l++ {
+		var c float64
+		for i := 0; i < len(ei); i++ {
+			if j := i + l; j >= 0 && j < len(eo) {
+				c += ei[i] * eo[j]
+			}
+		}
+		if c >= 0.98*bestC && abs(l-prior/hop) < abs(pick-prior/hop) {
+			pick = l
+		}
+	}
+	return pick * hop
+}
+
+func abs(x int) int {
+	if x < 0 {
+		return -x
+	}
+	return x
+}
+
+// shiftIndex maps an output position to the pipeline index Render reads.
+// A negative offset (the pipeline leaks onsets forward) would zero-fill
+// the first |off| samples and lose the clip's head — but the stream's
+// first emitted output inherently covers input ~0. So the applied shift
+// ramps linearly 0→off over ~6|off| positions: a monotone map that
+// time-squeezes the head gently (j ≈ 5i/6) instead of replacing it with
+// silence or replaying a slice of it (a hard join would echo ~28 ms).
+func shiftIndex(i, off int) int {
+	if off >= 0 || i >= -6*off {
+		return i + off
+	}
+	return i + off*i/(-6*off)
+}
+
 // Render processes a whole clip offline, flushing every stage's tail.
 // The result is lip-synced: it is shifted back by the measured pipeline
 // onset offset and always returns exactly len(in) samples (the residual
@@ -388,10 +557,15 @@ func (e *Engine) Render(in []float32) []float32 {
 		}
 		off := 0
 		if e.morphActive() {
-			off = morphOffset(e.pitchR)
+			// the true input→output offset is signal- and
+			// position-dependent: measure it by cross-correlating the
+			// input's and the pipeline output's energy envelopes,
+			// constrained to a window around the fitted constant
+			off = alignLag(x, mix, morphOffset(e.pitchR))
 		}
 		for i := range out {
-			if j := i + off; j >= 0 && j < len(mix) {
+			j := shiftIndex(i, off)
+			if j >= 0 && j < len(mix) {
 				out[i] = float32(mix[j])
 			}
 		}
