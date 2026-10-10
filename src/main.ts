@@ -290,7 +290,9 @@ function stopMonitor() {
 
 function bindMonitor() {
   $("#monitor").addEventListener("click", async () => {
-    if (monitor.running) {
+    if (monitor.running || monitor.pending) {
+      // running → stop; pending → cancel the in-flight start (its
+      // attempt resolves "stale" and releases its own devices)
       stopMonitor();
       $("#monitor").textContent = "开始监听";
       $("#monitor").classList.remove("live");
@@ -298,13 +300,17 @@ function bindMonitor() {
       return;
     }
     try {
+      $("#monitor").textContent = "启动中…"; // click again to cancel
       const r = await monitor.start({
         resetStream: () => bridge.resetStream(),
         setup: setupMonitor,
       });
       // busy = a start is already in flight (double click);
       // stale = stop() raced in mid-setup and the attempt released itself
-      if (r !== "started") return;
+      if (r !== "started") {
+        $("#monitor").textContent = "开始监听";
+        return;
+      }
       $("#monitor").textContent = "停止监听";
       $("#monitor").classList.add("live");
       $("#mic-status").textContent = inApp
@@ -312,6 +318,7 @@ function bindMonitor() {
         : "浏览器预览：音频原样返回（无 Go 引擎）";
       showRtStats();
     } catch (err) {
+      $("#monitor").textContent = "开始监听";
       $("#mic-status").textContent = `麦克风不可用：${(err as Error).message}`;
     }
   });

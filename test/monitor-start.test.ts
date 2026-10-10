@@ -189,4 +189,41 @@ describe("MonitorSupervisor", () => {
     expect(attempts[0]!.stream!.tracks.every((t) => t.stopped)).toBe(true);
     expect(attempts[0]!.node!.disconnected).toBe(true);
   });
+
+  test("pending 暴露启动中状态：挂起的 start 可被 stop() 取消且不影响下次启动", async () => {
+    const monitor = new MonitorSupervisor();
+    const mic = gate<Attempt["stream"]>();
+    const attempts: Attempt[] = [];
+    const deps: MonitorStartDeps = {
+      resetStream: () => Promise.resolve(4000),
+      setup: setupWithMic(mic.p, attempts),
+    };
+
+    const p = monitor.start(deps);
+    await sleep(1); // setup reached the mic gate
+    // 权限弹窗挂着时 running=false 但 pending=true —— UI 按此判定可取消
+    expect(monitor.pending).toBe(true);
+    expect(monitor.running).toBe(false);
+
+    monitor.stop(); // UI 上的"取消"：作废这一代
+    mic.resolve(fakeStream()); // 晚到的授权落地
+    expect(await p).toBe("stale");
+    expect(monitor.pending).toBe(false);
+    expect(monitor.session).toBeUndefined();
+    // 过期 attempt 自释放了它拿到的设备
+    expect(attempts[0]!.ctx.closed).toBe(true);
+    expect(attempts[0]!.stream!.tracks.every((t) => t.stopped)).toBe(true);
+
+    // 取消后再点仍能正常启动
+    const mic2 = gate<Attempt["stream"]>();
+    const p2 = monitor.start({
+      resetStream: () => Promise.resolve(8000),
+      setup: setupWithMic(mic2.p, attempts),
+    });
+    expect(monitor.pending).toBe(true);
+    mic2.resolve(fakeStream());
+    expect(await p2).toBe("started");
+    expect(monitor.pending).toBe(false);
+    expect(monitor.running).toBe(true);
+  });
 });

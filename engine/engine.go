@@ -486,6 +486,19 @@ func (e *Engine) Process(in []float32) []float32 {
 		if e.bFade >= morphFadeLen {
 			e.bFading, e.bPrevQ = false, nil
 		}
+	} else if e.bFading && e.params.Bypass {
+		// Bypass turned ON while the wet side produced nothing
+		// (chain still warming): emit the dry line now — the user
+		// asked for dry audio and there is no wet tail to blend,
+		// so the fade is done.
+		// The un-bypass direction must NOT do this: emitting dry
+		// over positions the wet chain will still cover advances
+		// emit past them, so wet coverage lands stale forever —
+		// the fade never completes and Flush replays content that
+		// was already heard. That direction keeps the empty-mix
+		// stall, the same bounded hole as a preset switch.
+		out = dryD
+		e.bFading, e.bPrevQ = false, nil
 	} else {
 		out = mix
 	}
@@ -598,6 +611,9 @@ func alignLag(xIn, mix []float64, prior int) int {
 		return prior // silence: nothing to align
 	}
 	lo, hi := (prior-960)/hop-1, (prior+960)/hop+1
+	// one pass over the input: keep every lag's score so the
+	// closest-to-prior pick below doesn't rescan the whole clip
+	scores := make([]float64, hi-lo+1)
 	bestL, bestC := prior/hop, -1.0
 	for l := lo; l <= hi; l++ {
 		var c float64
@@ -606,6 +622,7 @@ func alignLag(xIn, mix []float64, prior int) int {
 				c += ei[i] * eo[j]
 			}
 		}
+		scores[l-lo] = c
 		if c > bestC {
 			bestC, bestL = c, l
 		}
@@ -617,13 +634,7 @@ func alignLag(xIn, mix []float64, prior int) int {
 	// lag closest to the fitted constant
 	pick := bestL
 	for l := lo; l <= hi; l++ {
-		var c float64
-		for i := 0; i < len(ei); i++ {
-			if j := i + l; j >= 0 && j < len(eo) {
-				c += ei[i] * eo[j]
-			}
-		}
-		if c >= 0.98*bestC && abs(l-prior/hop) < abs(pick-prior/hop) {
+		if scores[l-lo] >= 0.98*bestC && abs(l-prior/hop) < abs(pick-prior/hop) {
 			pick = l
 		}
 	}

@@ -269,6 +269,15 @@ export class MonitorSupervisor {
   }
 
   /**
+   * A start is in flight (resetStream/setup still resolving). The UI
+   * must treat pending like running — a click then means "cancel":
+   * stop() supersedes the generation and the attempt self-releases.
+   */
+  get pending(): boolean {
+    return this.starting;
+  }
+
+  /**
    * One guarded start:
    *  - "busy"    — a start is already in flight (double click) or a
    *    session is running; nothing was created.

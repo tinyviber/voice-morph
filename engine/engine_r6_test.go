@@ -475,6 +475,38 @@ func TestSetParamsCost(t *testing.T) {
 	}
 }
 
+// TestBypassDuringWetWarmup is the Devin Review R7 regression:
+// toggling bypass ON while the wet chain is still warming must emit
+// the dry line immediately — the old branch fell through to
+// `out = mix` (empty → silence) until wet output landed, leaving the
+// user without even their dry voice. The un-bypass direction instead
+// keeps its bounded stall: emitting dry there would advance emit past
+// coverage the wet chain still owns (fade never completes, Flush
+// replays — the same shape as the R4 emit-cap deadlock).
+func TestBypassDuringWetWarmup(t *testing.T) {
+	const chunk = 2048
+	in := vowel(200, 900, 2.0)
+	e := New()
+	// start wet — the chain needs ~4-6k of input before producing
+	e.SetParams(Params{Pitch: 0.5})
+	_ = e.Process(in[:chunk]) // block 1: still warming, may emit little
+	// toggle bypass ON inside the warmup window: wet output is not
+	// there yet, but the user must hear their dry voice NOW
+	e.SetParams(Params{Pitch: 0.5, Bypass: true})
+	var silent, blocks int
+	for i := chunk; i < len(in); i += chunk {
+		end := min(i+chunk, len(in))
+		o := e.Process(in[i:end])
+		blocks++
+		if len(o) == 0 || rms32(o) == 0 {
+			silent++
+		}
+	}
+	if silent > 0 {
+		t.Fatalf("bypass during wet warmup: %d/%d blocks emitted silence", silent, blocks)
+	}
+}
+
 func rms32(x []float32) float64 {
 	if len(x) == 0 {
 		return 0
