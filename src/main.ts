@@ -1,4 +1,7 @@
 import { bridge, inApp } from "./bridge";
+import { ChunkSender, MonitorSupervisor, STALE } from "./monitor-queue";
+import type { MonitorResources } from "./monitor-queue";
+import { isCallError } from "mygo-runtime";
 import type { Params, State } from "./mygo";
 const workletUrl = "worklet.js"; // served from public/ beside index.html
 
@@ -173,18 +176,52 @@ function syncEqInputs() {
 }
 
 // ── live monitor ───────────────────────────────────────────────
-let ctx: AudioContext | undefined;
-let stream: MediaStream | undefined;
-let node: AudioWorkletNode | undefined;
 let resultUrl: string | undefined;
-let running = false;
 let outLevel = 0;
 const scopeBuf = new Float32Array(4800);
 
-async function startMonitor() {
-  ctx = new AudioContext({ sampleRate: 48000, latencyHint: "interactive" });
+// The supervisor owns the session's devices and the generation guard:
+// the generation invalidates IPC results still in flight across a
+// stop→restart (a stale reply, including a timed-out call resolving
+// late, can never land on the new session's node), and a session's
+// ctx/stream/node are committed only once its whole start chain has
+// succeeded — see MonitorSupervisor in monitor-queue.ts.
+const monitor = new MonitorSupervisor();
+const MAX_BACKLOG = 8; // queued + in-flight blocks before drop-oldest
+const IPC_TIMEOUT_MS = 1800; // ≫ engine latency (~110ms): one hung processChunk must never stall the queue
+
+interface RtStats {
+  underruns: number;
+  overruns: number;
+  bufferedMs: number;
+}
+let lastStats: RtStats = { underruns: 0, overruns: 0, bufferedMs: 0 };
+
+function showRtStats(s?: RtStats) {
+  const sender = monitor.session?.sender;
+  if (!sender) return; // stopped (or strays from a dead generation)
+  if (s) lastStats = s;
+  const el = $("#rt-stats");
+  el.hidden = false;
+  // end-to-end queue delay ≈ blocks waiting on the send side + the
+  // worklet's play-side ring
+  const queueMs = sender.queueMs + lastStats.bufferedMs;
+  el.title = "排队≈发送队列+播放缓冲的延迟估计；丢块=积压丢弃或调用失败；超时=IPC 无响应；重同步=超时/被拒后换新流续发";
+  el.textContent = `缓冲 ${lastStats.bufferedMs}ms · 排队 ${queueMs}ms · 欠载 ${lastStats.underruns} · 丢块 ${sender.droppedBlocks} · 溢出 ${lastStats.overruns} · 超时 ${sender.ipcTimeouts} · 重同步 ${sender.resyncs}`;
+}
+
+// One start attempt's async chain: every device is LOCAL to `res`
+// until MonitorSupervisor commits it — a failed or superseded attempt
+// releases only what it acquired, never another session's devices.
+async function setupMonitor(
+  res: MonitorResources,
+  streamBase: number,
+  isLive: () => boolean,
+): Promise<void> {
+  const ctx = new AudioContext({ sampleRate: 48000, latencyHint: "interactive" });
+  res.ctx = ctx;
   await ctx.audioWorklet.addModule(workletUrl);
-  stream = await navigator.mediaDevices.getUserMedia({
+  const stream = await navigator.mediaDevices.getUserMedia({
     audio: {
       channelCount: 1,
       echoCancellation: false,
@@ -192,58 +229,96 @@ async function startMonitor() {
       autoGainControl: false,
     },
   });
+  res.stream = stream;
   const src = ctx.createMediaStreamSource(stream);
-  node = new AudioWorkletNode(ctx, "duplex", { outputChannelCount: [1] });
-  // serialize IPC through a promise chain: every captured block is
-  // sent (dropping whole blocks would punch content holes — deleted
-  // syllables — into the morphed stream)
-  let chain: Promise<void> = Promise.resolve();
+  const node = new AudioWorkletNode(ctx, "duplex", { outputChannelCount: [1] });
+  res.node = node;
+  lastStats = { underruns: 0, overruns: 0, bufferedMs: 0 };
+  // serialize IPC through an explicit pending FIFO drained one call at a
+  // time; every block rides (streamID, seq) — past the bound the OLDEST
+  // unsent block is dropped (fresh speech over stale audio; the Go side
+  // counts the seq hole), and an IPC timeout or a stale rejection resyncs
+  // the sender onto a fresh stream ID instead of feeding a stream whose
+  // tail may already have consumed the abandoned block.
+  const sender = new ChunkSender(
+    {
+      isLive,
+      send: async (streamID, seq, block) => {
+        try {
+          return await bridge.processChunk(streamID, seq, f32ToB64(block));
+        } catch (err) {
+          // Go refused the (stream, seq) pair: translate the protocol
+          // rejection into the sender's resync signal; anything else is
+          // an ordinary IPC failure (drop the block, keep the stream).
+          if (isCallError(err) && err.message.startsWith("voicemorph: stale")) {
+            return STALE;
+          }
+          throw err;
+        }
+      },
+      onOutput: (outB64) => {
+        const out = b64ToF32(outB64);
+        outLevel = rms(out);
+        node.port.postMessage(out, [out.buffer]);
+      },
+      onCounts: () => showRtStats(),
+    },
+    MAX_BACKLOG,
+    IPC_TIMEOUT_MS,
+    streamBase,
+  );
+  res.sender = sender;
   node.port.onmessage = (e) => {
+    if (e.data.stats) {
+      showRtStats(e.data.stats as RtStats);
+      return;
+    }
     const block: Float32Array = e.data.in;
+    if (!block) return;
     feedScope(block);
-    chain = chain.then(async () => {
-      const outB64 = await bridge.processChunk(f32ToB64(block));
-      const out = b64ToF32(outB64);
-      outLevel = rms(out);
-      node?.port.postMessage(out, [out.buffer]);
-    }).catch(() => {}); // keep the chain alive on a failed call
+    sender.push(block);
+    showRtStats();
   };
   src.connect(node);
   node.connect(ctx.destination);
-  await bridge.resetStream();
 }
 
 function stopMonitor() {
-  node?.disconnect();
-  stream?.getTracks().forEach((t) => t.stop());
-  ctx?.close();
-  node = undefined;
-  stream = undefined;
-  ctx = undefined;
+  monitor.stop(); // bumps the generation: queued + in-flight work dies
+  $("#rt-stats").hidden = true;
 }
 
 function bindMonitor() {
   $("#monitor").addEventListener("click", async () => {
-    if (running) {
+    if (monitor.running || monitor.pending) {
+      // running → stop; pending → cancel the in-flight start (its
+      // attempt resolves "stale" and releases its own devices)
       stopMonitor();
-      running = false;
       $("#monitor").textContent = "开始监听";
       $("#monitor").classList.remove("live");
       $("#mic-status").textContent = "麦克风未开启";
       return;
     }
     try {
-      await startMonitor().catch((err) => {
-        stopMonitor(); // release mic/graph if setup died midway
-        throw err;
+      $("#monitor").textContent = "启动中…"; // click again to cancel
+      const r = await monitor.start({
+        resetStream: () => bridge.resetStream(),
+        setup: setupMonitor,
       });
-      running = true;
+      // busy = a start is already in flight (double click);
+      // stale = stop() raced in mid-setup and the attempt released itself
+      if (r !== "started") {
+        $("#monitor").textContent = "开始监听";
+        return;
+      }
       $("#monitor").textContent = "停止监听";
       $("#monitor").classList.add("live");
       $("#mic-status").textContent = inApp
         ? "监听中 — 说话试试"
         : "浏览器预览：音频原样返回（无 Go 引擎）";
+      showRtStats();
     } catch (err) {
+      $("#monitor").textContent = "开始监听";
       $("#mic-status").textContent = `麦克风不可用：${(err as Error).message}`;
     }
   });
@@ -292,7 +367,6 @@ function bindFile() {
   dz.ondragleave = () => dz.classList.remove("drag");
   dz.ondrop = (e) => {
     e.preventDefault();
-    dz.classList.remove("drag");
     const f = e.dataTransfer?.files[0];
     if (f) void morphFile(f);
   };
@@ -379,7 +453,7 @@ function encodeWav16(samples: Float32Array, sr: number): Uint8Array {
   v.setUint32(16, 16, true);
   v.setUint16(20, 1, true);
   v.setUint16(22, 1, true);
-  v.setUint32(24, sr, true);
+  v.setUint16(24, sr, true);
   v.setUint32(28, sr * 2, true);
   v.setUint16(32, 2, true);
   v.setUint16(34, 16, true);

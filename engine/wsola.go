@@ -58,7 +58,7 @@ func (w *WSOLA) Process(in []float64) []float64 {
 func (w *WSOLA) Flush() []float64 { return w.drain(true) }
 
 func (w *WSOLA) drain(flush bool) []float64 {
-	var emitted []float64
+	emitted := make([]float64, 0, int(float64(len(w.in))/w.alpha)+2*w.frame)
 	avail := w.base + len(w.in) // first unread absolute index
 	for {
 		if w.prev < 0 {
@@ -67,7 +67,7 @@ func (w *WSOLA) drain(flush bool) []float64 {
 			}
 			w.place(0)
 			emitted = append(emitted, w.out[:w.hs]...)
-			w.out = append([]float64(nil), w.out[w.hs:]...)
+			w.out = w.out[w.hs:]
 			w.prev = 0
 			w.apos = float64(w.hs) * w.alpha
 			continue
@@ -93,16 +93,19 @@ func (w *WSOLA) drain(flush bool) []float64 {
 		p := w.pick(lo, hi, c)
 		w.place(p)
 		emitted = append(emitted, w.out[:w.hs]...)
-		w.out = append([]float64(nil), w.out[w.hs:]...)
+		w.out = w.out[w.hs:]
 		w.prev = p
 		// advance the nominal position only when a hop was actually
 		// emitted — a stalled iteration must not skip c's content
 		w.apos = c + float64(w.hs)*w.alpha
-		// drop input no grain can reach again
+		// drop input no grain can reach again; slide the live window
+		// down in place instead of re-allocating it every hop
 		drop := w.prev - w.base - w.delta - w.frame
 		if drop > 0 {
-			w.in = append([]float64(nil), w.in[drop:]...)
-			w.energy = append([]float64(nil), w.energy[drop:]...)
+			copy(w.in, w.in[drop:])
+			w.in = w.in[:len(w.in)-drop]
+			copy(w.energy, w.energy[drop:])
+			w.energy = w.energy[:len(w.energy)-drop]
 			w.base += drop
 			avail = w.base + len(w.in)
 		}
@@ -122,23 +125,28 @@ func (w *WSOLA) drain(flush bool) []float64 {
 // candidate grain's head.
 func (w *WSOLA) pick(lo, hi int, c float64) int {
 	b := w.base
+	in := w.in
+	inLen := len(in)
+	en := w.energy
+	enLen := len(en)
+	ov := w.ov
 	a0 := w.prev + w.hs - b
-	if a0+w.ov > len(w.in) {
+	if a0+ov > inLen {
 		return lo // previous grain's continuation not fully buffered
 	}
-	a := w.in[a0 : a0+w.ov : a0+w.ov]
+	a := in[a0 : a0+ov : a0+ov]
 	var ea float64
-	for j := 0; j < w.ov; j += 2 {
+	for j := 0; j < ov; j += 2 {
 		ea += a[j] * a[j]
 	}
 	if ea < 1e-12 {
 		return lo
 	}
 	e0 := float64(0)
-	if w.prev+w.hs-b-1 >= 0 && w.prev+w.hs-b-1 < len(w.energy) {
-		e0 = w.energy[w.prev+w.hs-b-1]
+	if i0 := w.prev + w.hs - b - 1; i0 >= 0 && i0 < enLen {
+		e0 = en[i0]
 	}
-	ea = w.energy[a0+w.ov-1] - e0 // exact energy of a
+	ea = en[a0+ov-1] - e0 // exact energy of a
 	if ea < 1e-12 {
 		return lo
 	}
@@ -149,16 +157,32 @@ func (w *WSOLA) pick(lo, hi int, c float64) int {
 	bestP, runnerP := lo, lo
 	for p := lo; p <= hi; p++ {
 		bi := p - b
-		var dot float64
-		for j := 0; j < w.ov; j += 2 {
-			if bi+j < 0 || bi+j >= len(w.in) {
-				continue
+		// valid j are the even indices where in[bi+j] is buffered —
+		// compute the range once instead of bounds-checking each
+		// multiply; skipped indices contributed nothing to dot anyway
+		jlo := 0
+		if bi < 0 {
+			jlo = -bi
+			if jlo&1 != 0 {
+				jlo++
 			}
-			dot += a[j] * w.in[bi+j]
+		}
+		jhi := ov
+		if rem := inLen - bi; rem < jhi {
+			jhi = rem
+		}
+		var dot float64
+		if jlo < jhi {
+			n := jhi - jlo
+			seg := in[bi+jlo : bi+jhi]
+			as := a[jlo : jlo+n]
+			for j := 0; j < n; j += 2 {
+				dot += as[j] * seg[j]
+			}
 		}
 		var eb float64
-		if bi-1 >= 0 && bi-1 < len(w.energy) && bi+w.ov-1 < len(w.energy) {
-			eb = w.energy[bi+w.ov-1] - w.energy[bi-1]
+		if bi-1 >= 0 && bi-1 < enLen && bi+ov-1 < enLen {
+			eb = en[bi+ov-1] - en[bi-1]
 		}
 		if eb < 1e-12 {
 			eb = 1e-12
@@ -184,11 +208,27 @@ func (w *WSOLA) place(p int) {
 		w.out = append(w.out, 0)
 	}
 	b := w.base
-	for j := 0; j < w.frame; j++ {
-		i := p + j - b
-		if i < 0 || i >= len(w.in) {
-			continue
-		}
-		w.out[j] += w.win[j] * w.in[i]
+	in := w.in
+	// the grain's read range [p, p+frame) overlaps the buffered input
+	// [b, b+len(in)) only for j in [jlo, jhi); outside it in[p+j-b] was
+	// skipped anyway
+	jlo := b - p
+	if jlo < 0 {
+		jlo = 0
+	}
+	jhi := b + len(in) - p
+	if jhi > w.frame {
+		jhi = w.frame
+	}
+	if jlo >= jhi {
+		return
+	}
+	n := jhi - jlo
+	i0 := p + jlo - b
+	src := in[i0 : i0+n]
+	dst := w.out[jlo:jhi]
+	win := w.win[jlo:jhi]
+	for k := 0; k < n; k++ {
+		dst[k] += win[k] * src[k]
 	}
 }
