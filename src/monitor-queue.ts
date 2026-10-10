@@ -188,3 +188,131 @@ export class ChunkSender {
     }
   }
 }
+
+// ── monitor session lifecycle ──────────────────────────────────
+// startMonitor used to write the global ctx/stream/node as each await
+// resolved and set `running` only after the whole chain finished, so a
+// double click ran two initializations whose globals overwrote each
+// other — and one attempt's failure could stopMonitor() the OTHER
+// attempt's live devices. The supervisor keeps every attempt's
+// resources LOCAL until the full chain succeeded AND the generation is
+// still current; only then is it committed as the active session.
+
+/**
+ * The devices one monitor session owns, filled incrementally by
+ * `setup`: assign each field the moment it is acquired so a mid-chain
+ * failure releases exactly what exists. Structural types keep this
+ * module free of DOM types — the app's real AudioContext / MediaStream /
+ * AudioWorkletNode all satisfy them.
+ */
+export interface MonitorResources {
+  ctx?: { close(): unknown };
+  stream?: { getTracks(): { stop(): void }[] };
+  node?: { disconnect(): void };
+  sender?: ChunkSender;
+}
+
+export interface MonitorStartDeps {
+  /**
+   * ResetStream IPC → the stream base the new epoch sends under. Runs
+   * BEFORE any audio flows: the Go side rebuilds stream state on the new
+   * epoch and rejects every chunk still in flight under an older stream
+   * ID, so a dead call can never mutate the new stream.
+   */
+  resetStream(): Promise<number>;
+  /**
+   * The full async audio chain (context → worklet → mic → graph →
+   * sender). Assign each resource into `res` as it is acquired; on any
+   * throw the supervisor releases only what `res` already holds.
+   * `isLive` is this attempt's generation check — feed it to the
+   * sender's isLive hook.
+   */
+  setup(res: MonitorResources, streamBase: number, isLive: () => boolean): Promise<void>;
+}
+
+/** Tear down a partial or committed session — never touches shared state. */
+function releaseMonitor(res: MonitorResources): void {
+  try {
+    res.node?.disconnect();
+  } catch {
+    /* ignore */
+  }
+  try {
+    res.stream?.getTracks().forEach((t) => t.stop());
+  } catch {
+    /* ignore */
+  }
+  try {
+    void res.ctx?.close();
+  } catch {
+    /* ignore */
+  }
+}
+
+export class MonitorSupervisor {
+  /**
+   * Bumped on every start attempt and every stop: the sender's isLive
+   * closure dies with it, so queued + in-flight IPC from a dead
+   * generation can never land on a newer session's stream.
+   */
+  gen = 0;
+  /** a start's whole async chain holds this — a second click is a no-op */
+  private starting = false;
+  /** the committed session, present only between start success and stop */
+  session: MonitorResources | undefined;
+
+  get running(): boolean {
+    return this.session !== undefined;
+  }
+
+  /**
+   * One guarded start:
+   *  - "busy"    — a start is already in flight (double click) or a
+   *    session is running; nothing was created.
+   *  - "started" — the chain finished while still current and was
+   *    committed as the live session.
+   *  - "stale"   — stop() raced in mid-setup: this attempt's resources
+   *    were released before ever going live; nothing was committed.
+   * A setup failure releases only THIS attempt's own resources and
+   * rethrows — it cannot tear down another session's devices.
+   */
+  async start(deps: MonitorStartDeps): Promise<"busy" | "started" | "stale"> {
+    if (this.starting || this.session) return "busy";
+    this.starting = true;
+    const gen = ++this.gen;
+    const res: MonitorResources = {};
+    try {
+      const streamBase = await deps.resetStream();
+      if (gen !== this.gen) return "stale"; // stop() raced the IPC
+      await deps.setup(res, streamBase, () => gen === this.gen);
+      if (gen !== this.gen) {
+        // Superseded while setting up: release what THIS attempt
+        // acquired — commit nothing, touch nothing else.
+        releaseMonitor(res);
+        return "stale";
+      }
+      this.session = res;
+      return "started";
+    } catch (err) {
+      // Kill the failed attempt's own sender (it may have been wired)
+      // and release only its own resources — never another session's.
+      this.gen++;
+      releaseMonitor(res);
+      throw err;
+    } finally {
+      this.starting = false;
+    }
+  }
+
+  /**
+   * Stop the live session (if any) and supersede any start still in
+   * flight — a superseded attempt releases its own resources when its
+   * chain unwinds, so stop() never has to wait on it.
+   */
+  stop(): void {
+    this.gen++;
+    const s = this.session;
+    this.session = undefined;
+    if (s) releaseMonitor(s);
+  }
+}
