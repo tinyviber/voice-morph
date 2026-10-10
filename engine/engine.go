@@ -43,8 +43,9 @@ const stallBlocks = 4
 // chain's lookahead — production still trails the last-seen input by
 // morphOffset+structural delay — so the switch underrun's causal
 // bound stands; the emit cap remains as the fallback. Bounded by the
-// dryQ window.
-const prewarmLen = 8192
+// dryQ window. A var (not const) so tests can zero it to reproduce the
+// pre-R5 cold-switch behavior for comparison.
+var prewarmLen = 8192
 
 // Params mirrors the MorphVOX Tweak Panel: pitch and timbre in ±1 units,
 // strength 0..1, plus a 10-band graphic EQ on both sides of the morph.
