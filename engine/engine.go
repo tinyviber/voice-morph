@@ -27,6 +27,13 @@ const SampleRate = 48000
 // same input position.
 const morphFadeLen = 1440
 
+// stallBlocks bounds how many consecutive blocks drainMorph may cap
+// emit while waiting for the new side's coverage to catch up
+// (~170 ms at 2048/block). Past the bound the position model is
+// abandoned and cur's output pairs by arrival order — a transition
+// must never wait forever.
+const stallBlocks = 4
+
 // Params mirrors the MorphVOX Tweak Panel: pitch and timbre in ±1 units,
 // strength 0..1, plus a 10-band graphic EQ on both sides of the morph.
 type Params struct {
@@ -100,6 +107,10 @@ type Engine struct {
 	bFade   int       // blended samples so far
 	bFading bool
 
+	stall int // consecutive emit-capped blocks this transition
+
+	dryQ []float64 // raw-input history feeding the bypass delay line
+
 	pitchR, timbreW, strength float64
 	inPos, outPos             int // streamed input / emitted output
 	sr                        float64
@@ -135,18 +146,30 @@ func (e *Engine) setParamsLocked(p Params) {
 		// swaps in a fresh chain and fades the previous side out.
 		nc := e.newChainLocked(r, w, p.Strength)
 		if e.cur != nil {
-			if e.prev != nil && e.fade == 0 {
-				// A transition was already in flight and cur never
-				// produced output: keep the covering side alive,
-				// drop the in-between side outright — everything it
-				// could still emit is redundant with the side that is
-				// actually speaking.
-			} else {
+			if e.prev == nil {
 				e.prev = e.cur
+				e.fade = 0
 			}
-			e.fade = 0
+			// else: switch-storm merge — a transition is already
+			// running, so keep the side that is actually covering
+			// the stream (it keeps speaking through the newest
+			// chain's warmup), drop the in-between chain outright
+			// and rebuild cur straight onto the latest target. The
+			// fade keeps its progress: blending resumes at the
+			// current ramp position instead of snapping prev back
+			// to full weight.
+			e.stall = 0
 		}
-		e.cur = &side{chain: nc, pos: e.inPos}
+		// pos labels content positions, not produced ordinals: the
+		// chain's produced sample #j carries input content ~j-off
+		// (WSOLA onsets land early for r>1, late for r<1), so blending
+		// prev(emit) with cur(emit) pairs same-position content
+		// instead of superposing two copies |off| apart.
+		off := 0
+		if nc != nil {
+			off = morphOffset(r)
+		}
+		e.cur = &side{chain: nc, pos: e.inPos - off}
 		e.pitchR, e.timbreW, e.strength = r, w, p.Strength
 	}
 	if p.Bypass != e.params.Bypass {
@@ -194,9 +217,16 @@ func (e *Engine) rebuildLocked() {
 	r := math.Pow(2, e.params.Pitch)
 	w := math.Pow(2, e.params.Timbre)
 	e.inPos, e.outPos = 0, 0
-	e.cur = &side{chain: e.newChainLocked(r, w, e.params.Strength), pos: 0}
+	nc := e.newChainLocked(r, w, e.params.Strength)
+	off := 0
+	if nc != nil {
+		off = morphOffset(r)
+	}
+	e.cur = &side{chain: nc, pos: -off}
 	e.prev = nil
 	e.fade = 0
+	e.stall = 0
+	e.dryQ = nil
 	e.bFading, e.bFade, e.bPrevQ = false, 0, nil
 	e.pitchR, e.timbreW, e.strength = r, w, e.params.Strength
 }
@@ -222,10 +252,41 @@ func (e *Engine) drainMorph() []float64 {
 		return cur
 	}
 	emit := e.outPos // next output position to fill
-	var out []float64
 	// drop stale coverage: prev kept speaking while cur warmed up, so
 	// the head of either queue may cover positions already emitted
 	e.prev.pos += dropHead(&e.prev.q, emit-e.prev.pos)
+	if !e.params.Bypass && len(cur) > 0 && emit-e.cur.pos >= len(cur) {
+		// Everything the new side has produced covers positions emit
+		// already passed — emit stayed glued to prev's frontier while
+		// cur warmed up, and every new production lands entirely in
+		// the stale region. Feeding emit more prev coverage only lets
+		// it run further ahead forever (the fade never starts and the
+		// new params never take over), so cap it instead: hold the
+		// coverage, emit nothing this block, and let cur's coverage
+		// end catch up — a one-time bounded hole, not a rewind and
+		// not a deadlock. Cur still warming up (len(cur)==0) is not
+		// this case: prev must keep filling emit then.
+		//
+		// While bypassed this cap is off: the drain result is
+		// discarded anyway, so the transition may sit unresolved
+		// (stale coverage simply drops) — crucially the relabel
+		// fallback must not run, or cur's position labels get pushed
+		// ahead of their true content and the delayed production is
+		// re-emitted after un-bypassing (replay). The transition
+		// resolves through the normal stall/catch-up path once the
+		// output goes wet again.
+		if e.stall < stallBlocks {
+			e.stall++
+			e.cur.q = cur // hold coverage for the next block
+			return nil
+		}
+		// bounded: the wait exceeded ~170 ms — abandon position
+		// alignment and pair cur's output by arrival order so the
+		// fade can start; never stall indefinitely.
+		e.cur.pos = emit
+	}
+	e.stall = 0
+	var out []float64
 	c0 := 0 // first unconsumed index in cur
 	if d := emit - e.cur.pos; d > 0 {
 		c0 = min(d, len(cur))
@@ -336,18 +397,45 @@ func (e *Engine) Process(in []float32) []float32 {
 	for i, v := range in {
 		x[i] = float64(v)
 	}
-	dry := x
+	e.dryQ = append(e.dryQ, x...)
 	x = e.pre.Process(x)
 	e.cur.push(x)
 	if e.prev != nil {
 		e.prev.push(x)
 	}
+	// The dry path pairs against emit positions, not arrival index:
+	// emit (=outPos before this block) lags the input by the live
+	// deficit, so delayed dry supplies coverage of the same positions
+	// the output emits this block — otherwise a wet→dry toggle skips
+	// the backlog (emit << inPos) and a dry→wet blend pairs
+	// mis-positioned content.
+	emit0 := e.outPos
+	d := e.inPos - len(x) - emit0
+	if d < 0 {
+		d = 0
+	}
 	mix := e.drainMorph()
+	i0 := len(e.dryQ) - len(x) - d
+	if i0 < 0 {
+		d += i0 // deficit beyond the keep window: emit what is available
+		i0 = 0
+	}
+	dryD := e.dryQ[i0 : i0+len(x)]
+	if keep := 8192 + len(x); len(e.dryQ) > keep {
+		e.dryQ = e.dryQ[len(e.dryQ)-keep:]
+	}
 	if e.params.Bypass && !e.bFading {
-		// dry pass-through; the morph sides keep running so queues
-		// stay bounded and un-bypassing blends immediately
-		e.outPos += len(in)
-		return append([]float32(nil), in...)
+		// dry pass-through on the wet timeline; the morph sides keep
+		// running so queues stay bounded and un-bypassing blends on
+		// the same positions. The output covered positions
+		// emit0..emit0+len(in) regardless of what the discarded drain
+		// emitted internally.
+		e.outPos = emit0 + len(in)
+		fout := make([]float32, len(dryD))
+		for i, v := range dryD {
+			fout[i] = float32(v)
+		}
+		return fout
 	}
 	mix = e.post.Process(mix)
 	g := e.params.Gain
@@ -355,10 +443,10 @@ func (e *Engine) Process(in []float32) []float32 {
 		mix[i] = softClip(v * g)
 	}
 	var out []float64
-	if e.bFading {
-		cur, prev := mix, dry
+	if e.bFading && len(mix) > 0 {
+		cur, prev := mix, dryD
 		if e.params.Bypass {
-			cur, prev = dry, mix
+			cur, prev = dryD, mix
 		}
 		e.bPrevQ = append(e.bPrevQ, prev...)
 		var used int
@@ -391,6 +479,10 @@ func (e *Engine) Flush() []float32 {
 		if e.cur.chain != nil {
 			e.cur.q = append(e.cur.q, e.cur.chain.flush()...)
 		}
+		// at flush there is no next block to wait on: exhaust the
+		// stall budget so the emit cap falls back to arrival pairing
+		// instead of holding coverage it can never release
+		e.stall = stallBlocks
 		mix := e.drainMorph()
 		mix = e.post.Process(mix)
 		g := e.params.Gain
