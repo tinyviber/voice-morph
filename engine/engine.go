@@ -34,6 +34,18 @@ const morphFadeLen = 1440
 // must never wait forever.
 const stallBlocks = 4
 
+// prewarmLen is how much already-received input history is fed to a
+// freshly rebuilt morph chain inside SetParams (~170 ms). Its purpose
+// is bounded: the chain's resampler/WSOLA/formant state warms up on
+// samples that already played, so the first live production at the
+// switch point is full-quality instead of carrying a cold-start
+// transient into the fade region. It cannot extend coverage past the
+// chain's lookahead — production still trails the last-seen input by
+// morphOffset+structural delay — so the switch underrun's causal
+// bound stands; the emit cap remains as the fallback. Bounded by the
+// dryQ window.
+const prewarmLen = 8192
+
 // Params mirrors the MorphVOX Tweak Panel: pitch and timbre in ±1 units,
 // strength 0..1, plus a 10-band graphic EQ on both sides of the morph.
 type Params struct {
@@ -170,6 +182,24 @@ func (e *Engine) setParamsLocked(p Params) {
 			off = morphOffset(r)
 		}
 		e.cur = &side{chain: nc, pos: e.inPos - off}
+		if nc != nil && len(e.dryQ) > 0 {
+			// Prewarm on the tail of already-received input so the
+			// new chain's cold-start transient lands on history that
+			// already played — coverage it produces here is content
+			// ≤ S, all stale-dropped — and live production at ~S is
+			// full-quality from sample one. The dryQ tail is
+			// re-filtered through a fresh EQ at the NEW gains (cur's
+			// post-switch input domain); that filter's own startup
+			// transient lands in the same stale-dropped coverage.
+			// pos keeps the R4 content-position semantics: feeding
+			// positions S-w..S labels produced #0 as (S-w)-off.
+			// Covers the switch-storm merge too — cur rebuilds
+			// through this same path.
+			n := min(len(e.dryQ), prewarmLen)
+			warm := NewEQ(p.EqPre, e.sr).Process(e.dryQ[len(e.dryQ)-n:])
+			e.cur.pos = e.inPos - n - off
+			e.cur.push(warm)
+		}
 		e.pitchR, e.timbreW, e.strength = r, w, p.Strength
 	}
 	if p.Bypass != e.params.Bypass {
