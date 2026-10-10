@@ -160,7 +160,10 @@ export class ChunkSender {
             this.timeoutMs,
           );
           if (out === TIMEOUT) {
+            // The abandoned call's late reply is discarded — this
+            // block's audio is just as gone as a FAILED/STALE one.
             this.ipcTimeouts++;
+            this.droppedBlocks++;
             this.counted();
             this.resync();
           } else if (out === STALE) {

@@ -90,7 +90,9 @@ describe("ChunkSender", () => {
     expect(sent[1]).toEqual({ streamID: 5001, seq: 0, block: 3 });
     expect(sent).toHaveLength(2);
     expect(outputs).toEqual(["out2"]);
-    expect(sender.droppedBlocks).toBe(1); // block 2 flushed by the resync
+    // block 1's abandoned reply will never play, and block 2 was
+    // flushed by the resync — two captured blocks never played.
+    expect(sender.droppedBlocks).toBe(2);
 
     // the timed-out call resolving late mutates nothing further client-side
     resolveFirst("late");
@@ -144,6 +146,9 @@ describe("ChunkSender", () => {
     expect(sent.map((s) => s.streamID)).toEqual([7000, 7001, 7002]);
     expect(sent.map((s) => s.seq)).toEqual([0, 0, 0]);
     expect(sender.ipcTimeouts).toBe(3);
+    // every timed-out call's in-flight block is also a dropped block —
+    // its late reply is discarded, so the audio never plays.
+    expect(sender.droppedBlocks).toBe(3);
     expect(sender.resyncs).toBe(3); // the third timeout burns 7003 too (unused)
   });
 
@@ -191,6 +196,7 @@ describe("ChunkSender", () => {
     expect(sent.map((s) => s.streamID)).toEqual([9000, 9000]);
     expect(sent.map((s) => s.seq)).toEqual([0, 1]);
     expect(sender.droppedBlocks).toBe(1); // the failed call's block is counted lost
+    expect(sender.ipcTimeouts).toBe(0); // a transport failure is not a timeout
     expect(sender.resyncs).toBe(0);
     expect(outputs).toEqual(["ok"]);
   });
