@@ -59,6 +59,9 @@ func newPlayRing(fill int) *playRing {
 
 // push appends n produced samples, mirroring port.onmessage: overflow
 // past the ring cap and the 300 ms latency ceiling drops oldest-first.
+// The dropped count must be captured BEFORE clamping rCount — the
+// earlier order computed the drop from an already-clamped rCount and
+// silently recorded overruns=0 (R7 review finding).
 func (r *playRing) push(n int) {
 	r.rCount += n
 	if r.rCount > wkRingCap {
@@ -66,8 +69,9 @@ func (r *playRing) push(n int) {
 		r.rCount = wkRingCap
 	}
 	if r.rCount > wkCapSamples {
-		r.rCount -= r.rCount - wkCapSamples
-		r.overruns += r.rCount - wkCapSamples
+		drop := r.rCount - wkCapSamples
+		r.rCount = wkCapSamples
+		r.overruns += drop
 	}
 }
 
@@ -185,6 +189,40 @@ func worstSilence(v []int) int {
 	return mx
 }
 
+// TestPlayRingModelOverflow is the R7 regression on the model itself:
+// a push past CAP_SAMPLES must record the dropped samples before
+// clamping rCount — the earlier order measured the drop from the
+// already-clamped rCount and always recorded overruns=0, which would
+// also have falsified the conservation check had overflow triggered.
+func TestPlayRingModelOverflow(t *testing.T) {
+	// reviewer's case: 14000 buffered + 2048 pushed → drop 1648.
+	r := newPlayRing(14000)
+	r.push(2048)
+	if r.rCount != wkCapSamples {
+		t.Fatalf("rCount = %d, want %d", r.rCount, wkCapSamples)
+	}
+	if want := 14000 + 2048 - wkCapSamples; r.overruns != want {
+		t.Fatalf("overruns = %d, want %d", r.overruns, want)
+	}
+	// conservation: init+pushed = pulled+rCount+overruns (nothing pulled)
+	if rem := 14000 + 2048 - r.rCount - r.overruns; rem != 0 {
+		t.Fatalf("conservation: unpulled remainder %d", rem)
+	}
+	// wrap path: past RING_CAP the wrap loss and the cap drop both count.
+	r2 := newPlayRing(14000)
+	r2.push(36000) // 50000: wrap drops 2000, cap drops 33600
+	if r2.rCount != wkCapSamples || r2.overruns != 35600 {
+		t.Fatalf("wrap+cap: rCount=%d overruns=%d, want %d/%d",
+			r2.rCount, r2.overruns, wkCapSamples, 35600)
+	}
+	// push under the cap drops nothing.
+	r3 := newPlayRing(2048)
+	r3.push(2048)
+	if r3.rCount != 4096 || r3.overruns != 0 {
+		t.Fatalf("clean push: rCount=%d overruns=%d", r3.rCount, r3.overruns)
+	}
+}
+
 // TestSwitchPlaybackUnderrun is the R6 acceptance: the switch hole is
 // judged at the player, parameterized by the ring's water level when
 // the stream starts — 0 and 2048 sit under the prebuffer gate, 4096 is
@@ -195,9 +233,22 @@ func TestSwitchPlaybackUnderrun(t *testing.T) {
 	for _, dir := range []struct {
 		name     string
 		from, to float64
+		// R7 experience-regression bounds per initial fill:
+		// {max post-switch starved samples, max continuous silence}.
+		// Baselines measured at this head (dry→wet 2272/2160,
+		// wet→wet 608/528) plus margin; 0 where a healthy ring
+		// fully absorbed the hole. Improvements stay green — the
+		// bound only fails on a real regression vs today.
+		exp map[int][2]int
 	}{
-		{"dry→wet 0→+0.5", 0, 0.5},
-		{"wet→wet +0.5→+1", 0.5, 1},
+		{"dry→wet 0→+0.5", 0, 0.5, map[int][2]int{
+			0: {2432, 2432}, 2048: {2432, 2432}, wkPrebuffer: {2432, 2432},
+			8192: {0, 0}, wkCapSamples: {0, 0},
+		}},
+		{"wet→wet +0.5→+1", 0.5, 1, map[int][2]int{
+			0: {736, 704}, 2048: {736, 704}, wkPrebuffer: {736, 704},
+			8192: {0, 0}, wkCapSamples: {0, 0},
+		}},
 	} {
 		t.Logf("=== %s ===", dir.name)
 		t.Logf("%8s %8s %8s %8s %8s %10s %10s %9s %9s", "init", "lvl@sw", "postDef", "preStv", "postStv", "underQ", "worstSil", "prebuf", "ovr")
@@ -249,11 +300,26 @@ func TestSwitchPlaybackUnderrun(t *testing.T) {
 				t.Errorf("%s fill=%d: underrun %d exceeds deficit(%d)+slack",
 					dir.name, fill, postStarved, postDef)
 			}
-			// The continuous silence must stay inside the causal
-			// bound: new-chain lookahead (~4608) + emit cap + grain.
+			// Correctness bound: the continuous silence must stay
+			// inside the causal bound (new-chain lookahead ~4608 +
+			// emit cap + grain) — proves the sim is not stuck.
 			if bound := 4608 + stallBlocks*chunk + wkQuantum; worst > bound {
 				t.Errorf("%s fill=%d: continuous silence %.0f ms exceeds bound %.0f ms",
 					dir.name, fill, float64(worst)/48, float64(bound)/48)
+			}
+			// R7 experience-regression bound: a much tighter
+			// per-fill limit pinned near today's measured values,
+			// so a change that worsens the audible underrun fails
+			// loudly even while staying under the causal bound.
+			if b, ok := dir.exp[fill]; ok {
+				if postStarved > b[0] {
+					t.Errorf("%s fill=%d: post-switch starved %d exceeds experience bound %d",
+						dir.name, fill, postStarved, b[0])
+				}
+				if worst > b[1] {
+					t.Errorf("%s fill=%d: continuous silence %d exceeds experience bound %d",
+						dir.name, fill, worst, b[1])
+				}
 			}
 		}
 	}
