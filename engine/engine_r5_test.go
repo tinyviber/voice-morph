@@ -20,7 +20,12 @@ import (
 // the causal bound, not a bug: this test reports the residual and
 // asserts the achievable contract — no deadlock, the transition
 // completes, and the hole never exceeds the new chain's lookahead.
-func TestSwitchNoUnderrun(t *testing.T) {
+//
+// Name note (R6): this test verifies a *bounded stall*, not zero
+// underrun — a ~90 ms hole is expected and allowed by the bound below.
+// The player-level underrun contract lives in TestSwitchPlaybackUnderrun
+// (engine_r6_test.go), which models the worklet ring and its prebuffer.
+func TestSwitchBoundedStall(t *testing.T) {
 	const chunk = 2048
 	in := vowel(200, 900, 3.0)
 	e := New()
@@ -40,14 +45,14 @@ func TestSwitchNoUnderrun(t *testing.T) {
 		o := e.Process(in[i:end])
 		blockLen = append(blockLen, len(o))
 	}
-	// an underrun is a block shorter than its input by >1 quantum;
+	// a stalled block is one shorter than its input by >1 quantum;
 	// the stream's final partial block is a boundary, not an
 	// interruption, so it is judged against its real length
-	underrun := 0
+	stalled := 0
 	run, worstRun := 0, 0
 	for i := swBlock; i < len(blockLen); i++ {
 		if blockLen[i] < blockIn[i]-128 {
-			underrun++
+			stalled++
 			run++
 			if run > worstRun {
 				worstRun = run
@@ -60,8 +65,8 @@ func TestSwitchNoUnderrun(t *testing.T) {
 	for i := swBlock; i < len(blockLen); i++ {
 		residual += blockIn[i] - min(blockLen[i], blockIn[i])
 	}
-	t.Logf("post-switch underrun: %d blocks (worst run %d), %d samples residual (~%.0f ms)",
-		underrun, worstRun, residual, float64(residual)/48)
+	t.Logf("post-switch stall: %d blocks (worst run %d), %d samples residual (~%.0f ms)",
+		stalled, worstRun, residual, float64(residual)/48)
 	if worstRun > stallBlocks {
 		t.Fatalf("deadlock: %d consecutive under-run blocks", worstRun)
 	}
