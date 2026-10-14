@@ -145,7 +145,8 @@ func (d *Dubber) SaveTimelineFile(path, payload string) string {
 // Render runs the batch render and returns the manifest.
 func (d *Dubber) Render(timelinePath, voicesPath, outDir string) string {
 	m, err := dubbing.Render(dubbing.RenderOptions{
-		TimelinePath: timelinePath, VoicesPath: voicesPath, OutDir: outDir})
+		TimelinePath: timelinePath, VoicesPath: voicesPath, OutDir: outDir,
+		WriteSrc: true})
 	if err != nil && m == nil {
 		return errJSON(err)
 	}

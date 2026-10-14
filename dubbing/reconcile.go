@@ -903,6 +903,27 @@ func finalizeTakes(t *Timeline, lines []normLine, opts ReconcileOptions) {
 			}
 		}
 	}
+
+	// Parts of a line split by a pause are not takes: number them
+	// part_index 1..N in time order so consumers can tell "one reading
+	// in several pieces" apart from "N competing readings".
+	for _, idxs := range byLine {
+		var parts []int
+		for _, idx := range idxs {
+			if t.Segments[idx].TakeIndex == 0 {
+				parts = append(parts, idx)
+			}
+		}
+		if len(parts) < 2 {
+			continue
+		}
+		sort.Slice(parts, func(a, b int) bool {
+			return t.Segments[parts[a]].StartMs < t.Segments[parts[b]].StartMs
+		})
+		for order, idx := range parts {
+			t.Segments[idx].PartIndex = order + 1
+		}
+	}
 }
 
 // isPrefixOf reports whether short is a normalized prefix of long.

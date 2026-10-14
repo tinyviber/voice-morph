@@ -96,6 +96,11 @@ func ValidateModelDir(dir, kind string) ModelCandidate {
 	return c
 }
 
+// Repository ids differ by hub: "iic" is the ModelScope org, HF hosts the
+// models under FunAudioLLM (plus an iic mirror some tools produce).
+var modelIDsMS = []string{"iic/SenseVoiceSmall", "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch"}
+var modelIDsHF = []string{"FunAudioLLM/SenseVoiceSmall", "FunAudioLLM/fsmn-vad", "iic/SenseVoiceSmall", "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch"}
+
 func hfSnapshotDirs(cache, modelID string) []string {
 	// HF cache layout: <cache>/models--iic--SenseVoiceSmall/snapshots/<rev>/
 	base := filepath.Join(cache, "models--"+strings.ReplaceAll(modelID, "/", "--"), "snapshots")
@@ -145,14 +150,14 @@ func ScanModels(cfg *UserConfig) []ModelCandidate {
 	}
 	// Explicit cache overrides via env.
 	for _, c := range []string{os.Getenv("MODELSCOPE_CACHE"), os.Getenv("XDG_CACHE_HOME") + "/modelscope/hub"} {
-		for _, id := range []string{"iic/SenseVoiceSmall", "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch"} {
+		for _, id := range modelIDsMS {
 			for _, d := range msLayoutDirs(c, id) {
 				add(d, "modelscope")
 			}
 		}
 	}
 	for _, c := range []string{os.Getenv("HF_HOME"), os.Getenv("HUGGINGFACE_HUB_CACHE"), os.Getenv("XDG_CACHE_HOME") + "/huggingface/hub"} {
-		for _, id := range []string{"iic/SenseVoiceSmall", "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch"} {
+		for _, id := range modelIDsHF {
 			for _, d := range hfSnapshotDirs(c, id) {
 				add(d, "hf")
 			}
@@ -164,14 +169,14 @@ func ScanModels(cfg *UserConfig) []ModelCandidate {
 			filepath.Join(home, ".cache/modelscope/hub"),
 			filepath.Join(home, ".cache/modelscope"),
 		} {
-			for _, id := range []string{"iic/SenseVoiceSmall", "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch"} {
+			for _, id := range modelIDsMS {
 				for _, d := range msLayoutDirs(base, id) {
 					add(d, "modelscope")
 				}
 			}
 		}
 		for _, base := range []string{filepath.Join(home, ".cache/huggingface/hub")} {
-			for _, id := range []string{"iic/SenseVoiceSmall", "iic/speech_fsmn_vad_zh-cn-16k-common-pytorch"} {
+			for _, id := range modelIDsHF {
 				for _, d := range hfSnapshotDirs(base, id) {
 					add(d, "hf")
 				}

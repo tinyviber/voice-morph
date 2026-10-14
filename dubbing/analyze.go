@@ -17,6 +17,9 @@ type AnalyzeOptions struct {
 	ModelDir   string
 	Language   string
 	ChunkSec   int // Go-side fallback chunking window; 0 disables pre-chunking
+	// BatchSizeS is FunASR's VAD merge/batch budget in seconds of audio
+	// (CPU memory pressure scales with it). Default 120 per FunASR docs.
+	BatchSizeS int
 	NoVAD      bool
 	ConfigPath string
 	OnProgress func(ProgressEvent)
@@ -90,7 +93,7 @@ func Analyze(opts AnalyzeOptions) (*ASRDoc, *Timeline, error) {
 	needChunk := !lr.VAD && opts.ChunkSec > 0 && durMs > int64(opts.ChunkSec)*1000
 	if !needChunk {
 		r, err := w.Transcribe(opts.AudioPath, 0, opts.Language, lr.WordTimestamps,
-			lr.VAD, 15, opts.ChunkSecOrDefault(), true, opts.OnProgress)
+			lr.VAD, 15, opts.batchSizeS(), true, opts.OnProgress)
 		if err != nil {
 			return nil, nil, fmt.Errorf("E_ASR: %w", err)
 		}
@@ -116,7 +119,7 @@ func Analyze(opts AnalyzeOptions) (*ASRDoc, *Timeline, error) {
 			}
 			offMs := int64(off) * 1000 / engine.SampleRate
 			r, err := w.Transcribe(wavPath, offMs, opts.Language, lr.WordTimestamps,
-				false, 15, opts.ChunkSecOrDefault(), true, opts.OnProgress)
+				false, 15, opts.batchSizeS(), true, opts.OnProgress)
 			if err != nil {
 				return nil, nil, fmt.Errorf("E_ASR: chunk %d: %w", len(chunks), err)
 			}
@@ -182,6 +185,13 @@ func (o AnalyzeOptions) ChunkSecOrDefault() int {
 		return o.ChunkSec
 	}
 	return 300
+}
+
+func (o AnalyzeOptions) batchSizeS() int {
+	if o.BatchSizeS > 0 {
+		return o.BatchSizeS
+	}
+	return 120
 }
 
 func minCutSamp(sr int) int { return sr / 2 }

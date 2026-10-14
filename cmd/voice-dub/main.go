@@ -89,7 +89,7 @@ voice-dub <command> [flags]
   models scan|status|set|test|download   模型发现/校验/下载
   analyze    --audio WAV --script script.json --out DIR   ASR+校对
   reconcile  --out DIR [--script P --asr P] [--merge-reviewed]  重跑校对
-  render     --timeline P --voices voices.json --out DIR  批量变声导出
+  render     --timeline P --voices voices.json --out DIR [--audio A --only ids --src --keep-going --jobs N]  批量变声导出
   version`)
 }
 
@@ -347,6 +347,8 @@ func runRender(args []string, stdout, stderr io.Writer) int {
 	voicesP := fs.String("voices", "", "voices.json（必填）")
 	outDir := fs.String("out", "", "输出目录（必填，建议 <session>/rendered）")
 	only := fs.String("only", "", "逗号分隔的 segment_id/line_id 白名单")
+	audioP := fs.String("audio", "", "覆盖 timeline.audio 的音频路径（仍校验 sha256）")
+	src := fs.Bool("src", false, "每段附带原声切片 lines/src-<seg>.wav")
 	keep := fs.Bool("keep-going", false, "单段失败继续")
 	jobs := fs.Int("jobs", 0, "并行渲染数")
 	if err := fs.Parse(args); err != nil {
@@ -363,8 +365,8 @@ func runRender(args []string, stdout, stderr io.Writer) int {
 		}
 	}
 	m, err := dubbing.Render(dubbing.RenderOptions{
-		TimelinePath: *tlP, VoicesPath: *voicesP, OutDir: *outDir,
-		Only: onlySet, KeepGoing: *keep, Jobs: *jobs,
+		TimelinePath: *tlP, VoicesPath: *voicesP, AudioPath: *audioP, OutDir: *outDir,
+		Only: onlySet, KeepGoing: *keep, Jobs: *jobs, WriteSrc: *src,
 		OnProgress: func(d, t int) { fmt.Fprintf(stderr, "\r渲染 %d/%d", d, t) }})
 	if err != nil && m == nil {
 		code := "E_IO"

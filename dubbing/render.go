@@ -24,6 +24,7 @@ type ManifestLine struct {
 	LineID      string  `json:"line_id,omitempty"`
 	RoleID      string  `json:"role_id"`
 	Wav         string  `json:"wav"` // lines/<id>-<key8>.wav, relative to out dir
+	SrcWav      string  `json:"src_wav,omitempty"` // lines/src-<id>.wav, unmorphed same window
 	CutStartMs  int64   `json:"cut_start_ms"`
 	CutEndMs    int64   `json:"cut_end_ms"`
 	DurationMs  int64   `json:"duration_ms"`
@@ -57,6 +58,9 @@ type Manifest struct {
 	Subtitles  string            `json:"subtitles"`
 	SubtitleJSON string          `json:"subtitle_json"`
 	Warnings   []string          `json:"warnings,omitempty"`
+	// Extra is an opaque passthrough slot for downstream tooling
+	// (set via RenderOptions.Extra); the renderer never interprets it.
+	Extra      json.RawMessage   `json:"extra,omitempty"`
 }
 
 // LoadManifest reads and checks a rendered manifest.
@@ -85,6 +89,10 @@ type RenderOptions struct {
 	KeepGoing    bool
 	Jobs         int
 	OnProgress   func(done, total int)
+	Extra        json.RawMessage // opaque passthrough into manifest.extra
+	// WriteSrc writes lines/src-<segid>.wav — the raw source window next
+	// to each rendered line so agents/listeners can A/B without reslicing.
+	WriteSrc bool
 }
 
 // ctxWarmMs bounds how much leading context we feed the DSP so its
@@ -134,7 +142,7 @@ func Render(opts RenderOptions) (*Manifest, error) {
 	m := &Manifest{Version: SchemaVersion, Audio: audioPath, AudioSHA256: tl.AudioSHA256,
 		SampleRate: engine.SampleRate, DurationMs: int64(len(src)) * 1000 / engine.SampleRate,
 		Roles: map[string]string{}, Mix: "mix.wav", Subtitles: "subtitles.srt", SubtitleJSON: "subtitles.json",
-		Status: "ok"}
+		Status: "ok", Extra: opts.Extra}
 
 	segs := selectedForRender(tl, opts.Only)
 	sort.SliceStable(segs, func(i, j int) bool { return segs[i].StartMs < segs[j].StartMs })
@@ -249,10 +257,18 @@ func Render(opts RenderOptions) (*Manifest, error) {
 			}
 			return nil, err
 		}
+		srcName := ""
+		if opts.WriteSrc {
+			srcName = fmt.Sprintf("lines/src-%s.wav", j.seg.SegmentID)
+			if err := SaveWAV(joinOut(out, srcName), slice(src, cuts[i].a, cuts[i].b)); err != nil {
+				m.Warnings = append(m.Warnings, srcName+": "+err.Error())
+				srcName = ""
+			}
+		}
 		aMs, bMs := int64(cuts[i].a)*1000/engine.SampleRate, int64(cuts[i].b)*1000/engine.SampleRate
 		m.Lines = append(m.Lines, ManifestLine{
 			SegmentID: j.seg.SegmentID, LineID: j.seg.LineID, RoleID: j.seg.RoleID,
-			Wav: wavName, CutStartMs: aMs, CutEndMs: bMs, DurationMs: bMs - aMs,
+			Wav: wavName, SrcWav: srcName, CutStartMs: aMs, CutEndMs: bMs, DurationMs: bMs - aMs,
 			Backend: "dsp", Experimental: j.exp})
 		if _, ok := roleBuf[j.seg.RoleID]; !ok {
 			roleBuf[j.seg.RoleID] = make([]float32, len(src))
@@ -317,6 +333,9 @@ func Render(opts RenderOptions) (*Manifest, error) {
 		want := int(ln.DurationMs) * engine.SampleRate / 1000
 		if len(x) != want {
 			m.Warnings = append(m.Warnings, fmt.Sprintf("%s: len %d != declared %dms", ln.Wav, len(x), ln.DurationMs))
+		}
+		if p := peakOf(x); p > 0.995 {
+			m.Warnings = append(m.Warnings, fmt.Sprintf("%s: peak %.3f (post-gain clipping)", ln.Wav, p))
 		}
 	}
 	return m, SaveJSON(joinOut(out, "manifest.json"), m)

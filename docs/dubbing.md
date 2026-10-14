@@ -69,11 +69,14 @@ VoiceMorph 的第二个工作区：**录音是事实来源，台本只是参考*
    防止漏读行蹭邻居音频、或前一句的重读段被错钉到下一句。
 5. **位置归属**：未被对齐的 B 侧字符（口头禅、重复词头）按就近原则
    归并到相邻行的 span，保证 `spoken_text` 里每个真实朗读的字都不丢。
-6. **take 处理**：unmatched 段若与邻近已绑定行 sim ≥ `TakeSimilarity`
-   （0.55）或为行首前缀（≥3 字）→ 该行的候选 take；`finalizeTakes`
-   按 solo 相似度选最优，差距 < `TakeAmbiguity`（0.08）时标
-   `ambiguous_takes` 交人工。所有 take 都保留在 timeline，未选中的
-   进 `manifest.skipped`，原始数据永不删。
+6. **take / part 分离**：unmatched 段若与邻近已绑定行 sim ≥
+   `TakeSimilarity`（0.55）或为行首前缀（≥3 字）→ 该行的候选 take；
+   `finalizeTakes` 按 solo 相似度选最优，差距 < `TakeAmbiguity`
+   （0.08）时标 `ambiguous_takes` 交人工。同一行被停顿拆成的多个段
+   不是 take——它们保持 `take_index=0` 并按时间拿 `part_index`
+   (1..N)；「同一 line_id 出现多次」要区分时看这两个字段。所有
+   take 都保留在 timeline，未选中的进 `manifest.skipped`，原始数据
+   永不删。
 7. **审核协议**：`review_required` + `review_reasons`（
    `low_similarity`/`estimated_boundary`/`ambiguous_takes`/
    `unmatched_audio`/`low_asr_confidence`/`needs_role`）。

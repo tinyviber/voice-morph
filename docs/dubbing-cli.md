@@ -41,8 +41,10 @@ GUI 与 CLI 共享同一份配置。
 `<out>/timeline-reviewed.json` 里 `edited:true` 的行（角色/文本/边界/
 选用）按 (line_id, asr_ref, ±2s) 并回新草稿。
 
-### `voice-dub render --timeline P --voices voices.json --out DIR [--only id1,id2] [--keep-going] [-jobs N]`
-读审核后的 timeline 批量变声。产物：
+### `voice-dub render --timeline P --voices voices.json --out DIR [--audio WAV] [--only id1,id2] [--src] [--keep-going] [-jobs N]`
+读审核后的 timeline 批量变声。`--audio` 可覆盖 timeline 里的音频路径
+（仍会校验 sha256，换了录音会拒绝）；`--src` 让每行附带原声切片
+`lines/src-<segid>.wav` 供 A/B 对比。产物：
 
 ```
 <out>/
@@ -65,9 +67,12 @@ manifest。
   "audio": "take.wav", "audio_sha256": "…", "sample_rate": 48000,
   "duration_ms": 12000, "status": "ok",
   "lines": [{"segment_id":"seg-0001","line_id":"l01","role_id":"narrator",
-             "wav":"lines/seg-0001-xxxxxxxx.wav","cut_start_ms":480,
+             "wav":"lines/seg-0001-xxxxxxxx.wav",
+             "src_wav":"lines/src-seg-0001.wav",   // --src 时
+             "cut_start_ms":480,
              "cut_end_ms":2500,"duration_ms":2020,"cache_hit":false,
              "backend":"dsp","experimental":false}],
+  "extra": { /* RenderOptions.Extra 透传槽，下游可写 */ },
   "skipped": [{"id":"seg-0004","reason":"take not selected"},
               {"id":"l04","reason":"script line has no audio"}],
   "failures": [], "roles": {"narrator":"roles/narrator.wav"},
@@ -96,9 +101,11 @@ manifest。
     "review_reasons": ["low_similarity","estimated_boundary",
       "ambiguous_takes","unmatched_audio","low_asr_confidence","needs_role"],
     "take_index": 2, "selected": true,       // 重读的候选 take
+    "part_index": 1,                          // 一行被停顿拆成多段时的段序
     "boundary": "measured|word|estimated",   // 边界可信度
     "edited": false                          // 人工碰过 → 重跑校对时被保留
   }],
+  "warnings": [],                            // 校对级全局警告
   "unmatched_lines": [{"line_id":"l04","role_id":"narrator",
                        "text":"我们下午再练","reason":"no_audio"}],
   "review_count": 4

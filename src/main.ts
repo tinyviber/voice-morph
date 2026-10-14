@@ -516,6 +516,9 @@ function bindWorkspaceTabs() {
     $("#live-pane").hidden = which !== "live";
     $("#live-actions").hidden = which !== "live";
     $("#dub-pane").hidden = which !== "dub";
+    // 配音页侧栏换成角色声线面板，隐藏实时预设 rail
+    const rail = document.querySelector<HTMLElement>(".rail");
+    if (rail) rail.hidden = which !== "live";
     $("#ws-title").textContent = which === "live" ? "实时变声" : "离线配音";
     $("#ws-sub").textContent = which === "live"
       ? "麦克风 → Go 引擎 → 监听"

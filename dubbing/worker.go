@@ -111,11 +111,11 @@ func FindPython(cfg *UserConfig) (string, error) {
 		}
 		v := strings.TrimSpace(string(out))
 		var maj, min int
-		if n, _ := fmt.Sscanf(v, "%d.%d", &maj, &min); n == 2 && (maj > 3 || (maj == 3 && min >= 9)) {
+		if n, _ := fmt.Sscanf(v, "%d.%d", &maj, &min); n == 2 && (maj > 3 || (maj == 3 && min >= 8)) {
 			return p, nil
 		}
 	}
-	return "", fmt.Errorf("未找到 python>=3.9 解释器（config.python_path / VOICEMORPH_PYTHON / PATH）")
+	return "", fmt.Errorf("未找到 python>=3.8 解释器（config.python_path / VOICEMORPH_PYTHON / PATH）")
 }
 
 type SpawnOptions struct {

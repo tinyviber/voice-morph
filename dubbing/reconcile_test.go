@@ -224,6 +224,9 @@ func TestReconcileLineSplitAcrossSegments(t *testing.T) {
 			t.Fatalf("part wrongly flagged as take: %+v", p)
 		}
 	}
+	if parts[0].PartIndex != 1 || parts[1].PartIndex != 2 {
+		t.Fatalf("parts should be numbered 1..2 in time order: %+v", parts)
+	}
 	if parts[0].EndMs > parts[1].StartMs {
 		t.Fatalf("parts overlap")
 	}

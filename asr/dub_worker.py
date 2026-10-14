@@ -18,7 +18,9 @@ Commands:
 Replies: {"type":"hello"|"loaded"|"progress"|"result"|"error"|"bye"|"downloaded"}
 """
 
+import contextlib
 import json
+import logging
 import os
 import re
 import sys
@@ -109,8 +111,9 @@ def _probe_word_ts(model):
             for i in range(16000):
                 v = int(3000 * math.sin(2 * math.pi * 220 * i / 16000)) if 4000 < i < 12000 else 0
                 w.writeframes(struct.pack("<h", v))
-        res = model.generate(input=path, language="zh", use_itn=False,
-                             output_timestamp=True, batch_size_s=30)
+        with contextlib.redirect_stdout(sys.stderr):
+            res = model.generate(input=path, language="zh", use_itn=False,
+                                 output_timestamp=True, batch_size_s=30)
         for item in res or []:
             if not isinstance(item, dict):
                 continue
@@ -151,7 +154,10 @@ def cmd_load(req):
         ncpu = int(req.get("ncpu") or 0)
         if ncpu > 0:
             kw["ncpu"] = ncpu
-        model = AutoModel(**kw)
+        # Third-party libs print progress/logs to stdout; the protocol
+        # channel must stay clean JSON-lines — force it all to stderr.
+        with contextlib.redirect_stdout(sys.stderr):
+            model = AutoModel(**kw)
     except Exception as e:
         err("load", "MODEL_LOAD_FAIL", str(e), True)
         return
@@ -259,7 +265,8 @@ def cmd_transcribe(req):
         kwargs["output_timestamp"] = True
     try:
         emit({"type": "progress", "done": 0, "total": 1})
-        res = model.generate(**kwargs)
+        with contextlib.redirect_stdout(sys.stderr):
+            res = model.generate(**kwargs)
         emit({"type": "progress", "done": 1, "total": 1})
     except Exception as e:
         err("transcribe", "ASR_FAIL", "%s\n%s" % (e, traceback.format_exc()[-800:]), True)
@@ -312,6 +319,10 @@ def cmd_download(req):
 
 
 def main():
+    # Any third-party logging (funasr/modelscope/urllib3) must not reach
+    # stdout: the protocol channel carries JSON-lines only.
+    logging.basicConfig(stream=sys.stderr, level=logging.WARNING,
+                        force=True)
     for line in sys.stdin:
         line = line.strip()
         if not line:

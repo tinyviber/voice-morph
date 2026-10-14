@@ -66,6 +66,10 @@ type TimelineSegment struct {
 	// this is the only take. Selected marks the take that renders.
 	TakeIndex int  `json:"take_index,omitempty"`
 	Selected  bool `json:"selected"`
+	// PartIndex numbers consecutive parts of one line that was split
+	// across speech segments (TakeIndex stays 0 — parts are one reading,
+	// not competing takes). 0 means the line rendered as a single span.
+	PartIndex int `json:"part_index,omitempty"`
 	// Boundary is "measured" (real segment edge), "word" (snapped to a
 	// word timestamp) or "estimated" (interpolated inside a segment).
 	Boundary string `json:"boundary,omitempty"`
@@ -97,6 +101,7 @@ type Timeline struct {
 	Segments    []TimelineSegment `json:"segments"`
 	UnmatchedLines   []UnmatchedLine `json:"unmatched_lines,omitempty"`
 	ReviewCount int `json:"review_count"`
+	Warnings    []string `json:"warnings,omitempty"`
 }
 
 // ParseTimeline decodes and validates a timeline document.
