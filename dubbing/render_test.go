@@ -1,11 +1,11 @@
 package dubbing
 
 import (
-	"strings"
 	"encoding/json"
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"voice-morph/engine"
@@ -242,6 +242,41 @@ func TestRender_UndisposedUnmatchedBlocksComplete(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("discard verdict must be recorded: %+v", m.Skipped)
+	}
+}
+
+func TestRenderRejectsMutuallySelectedTakes(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		segs []TimelineSegment
+	}{
+		{
+			name: "two takes",
+			segs: []TimelineSegment{
+				{SegmentID: "take-1", LineID: "l01", StartMs: 0, EndMs: 900,
+					MatchStatus: MatchRepeated, TakeIndex: 1, Selected: true},
+				{SegmentID: "take-2", LineID: "l01", StartMs: 1000, EndMs: 1900,
+					MatchStatus: MatchRepeated, TakeIndex: 2, Selected: true},
+			},
+		},
+		{
+			name: "take with another segment",
+			segs: []TimelineSegment{
+				{SegmentID: "part-1", LineID: "l01", StartMs: 0, EndMs: 900,
+					MatchStatus: MatchExact, Selected: true},
+				{SegmentID: "take-1", LineID: "l01", StartMs: 1000, EndMs: 1900,
+					MatchStatus: MatchRepeated, TakeIndex: 1, Selected: true},
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tl := &Timeline{Version: SchemaVersion, Audio: "unused.wav",
+				SampleRate: engine.SampleRate, Segments: tc.segs}
+			_, err := Render(RenderOptions{Timeline: tl, VoicesPath: filepath.Join(t.TempDir(), "unused.json")})
+			if err == nil || !strings.Contains(err.Error(), "line l01") {
+				t.Fatalf("want take-selection error before I/O, got %v", err)
+			}
+		})
 	}
 }
 

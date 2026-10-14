@@ -130,6 +130,59 @@ func TestMergeReviewed_SharedASRIDNoGraft(t *testing.T) {
 	}
 }
 
+// Sequence-derived IDs can shift when a new cut is inserted earlier in a
+// fused ASR span. A colliding `.2` ID must fail its raw-text/time checks and
+// resolve by evidence, so the old verdict follows the original audio to `.3`.
+func TestMergeReviewed_ReusedSegmentIDRequiresMatchingEvidence(t *testing.T) {
+	reviewed := &Timeline{Version: SchemaVersion, Audio: "t.wav", AudioSHA256: "sha",
+		Segments: []TimelineSegment{
+			{SegmentID: "asr-001.2", ASRSegmentID: "asr-001", LineID: "l02",
+				RoleID: "old-role", ScriptText: "目标台词", ASRRaw: "目标台词",
+				SpokenText: "人工修订后的台词", StartMs: 1200, EndMs: 2200,
+				MatchStatus: MatchExact, Selected: true, TakeIndex: 1,
+				Edited: true, Reviewed: true},
+		}}
+	draft := &Timeline{Version: SchemaVersion, Audio: "t.wav", AudioSHA256: "sha",
+		Segments: []TimelineSegment{
+			{SegmentID: "asr-001.2", ASRSegmentID: "asr-001", LineID: "l02",
+				RoleID: "new-role", ScriptText: "目标台词", ASRRaw: "新切点覆盖的不同内容",
+				SpokenText: "目标台词", StartMs: 1100, EndMs: 1800,
+				MatchStatus: MatchRepeated, Selected: false, TakeIndex: 1,
+				ReviewRequired: true, ReviewReasons: []string{ReviewAmbiguousTakes}},
+			{SegmentID: "asr-001.3", ASRSegmentID: "asr-001", LineID: "l02",
+				RoleID: "new-role", ScriptText: "目标台词", ASRRaw: "目标台词",
+				SpokenText: "目标台词", StartMs: 1600, EndMs: 3000,
+				MatchStatus: MatchRepeated, Selected: false, TakeIndex: 2,
+				ReviewRequired: true, ReviewReasons: []string{ReviewAmbiguousTakes}},
+		}}
+
+	merged, err := MergeReviewed(draft, reviewed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed := merged.Segments[0]
+	if changed.Reviewed || changed.Edited || changed.Selected || changed.RoleID != "new-role" ||
+		changed.SpokenText != "目标台词" {
+		t.Fatalf("old verdict incorrectly grafted onto reused .2 ID: %+v", changed)
+	}
+	original := merged.Segments[1]
+	if !original.Reviewed || !original.Edited || !original.Selected ||
+		original.RoleID != "old-role" || original.SpokenText != "人工修订后的台词" {
+		t.Fatalf("old verdict did not follow matching audio to .3: %+v", original)
+	}
+}
+
+func TestSegIndexRejectsReusedIDOutsideOriginalTimeRange(t *testing.T) {
+	old := TimelineSegment{SegmentID: "asr-001.2", ASRSegmentID: "asr-001", LineID: "l02",
+		ASRRaw: "同一句台词", SpokenText: "同一句台词", StartMs: 1000, EndMs: 2000}
+	new := old
+	new.StartMs, new.EndMs = 3500, 4500
+	idx := newSegIndex(&Timeline{Segments: []TimelineSegment{old}})
+	if _, ok := idx.resolve(new, true); ok {
+		t.Fatal("same sequence ID and lyric must not override a non-overlapping time range")
+	}
+}
+
 // Two takes of the same line share one ASRSegmentID: the reviewer's
 // pick must be resolved by stable identity, never by asr_ref alone —
 // otherwise both takes get Selected and the track doubles the line.

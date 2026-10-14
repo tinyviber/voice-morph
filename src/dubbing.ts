@@ -37,6 +37,10 @@ interface Timeline {
   unmatched_lines?: { line_id: string; role_id: string; text: string; reason: string; optional?: boolean }[];
   review_count: number;
 }
+interface TextFileRead {
+  exists: boolean;
+  text?: string;
+}
 
 const $ = <T extends HTMLElement>(s: string) => document.querySelector<T>(s)!;
 const esc = (s: string) => s.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]!);
@@ -259,6 +263,21 @@ function renderTable() {
       const s = tl!.segments[+el.dataset.i!]!;
       s.selected = el.checked;
       s.edited = true;
+      if (el.checked && s.line_id) {
+        for (const peer of tl!.segments) {
+          if (peer === s || peer.line_id !== s.line_id) continue;
+          // A selected take replaces every other segment for that line.
+          // Selecting a regular part likewise clears an active take, while
+          // leaving sibling parts selected as one reading.
+          if ((s.take_index ?? 0) > 0 || (peer.take_index ?? 0) > 0) {
+            if (peer.selected) {
+              peer.selected = false;
+              peer.edited = true;
+            }
+          }
+        }
+      }
+      renderTable();
     }));
 }
 
@@ -332,13 +351,19 @@ export function initDubbing() {
       // — reusing the previous session's voice config silently was a
       // real footgun.
       const v = outDir + "/voices.json";
+      voicesPath = "";
+      $("#dub-voices").textContent = "正在读取会话声线配置…";
       try {
-        await call(Dubber.loadTextFile(v));
-        voicesPath = v;
-        $("#dub-voices").textContent = v;
-      } catch {
-        voicesPath = "";
-        $("#dub-voices").textContent = "未选择（该会话无 voices.json）";
+        const loaded = await call<TextFileRead>(Dubber.loadTextFile(v));
+        if (loaded.exists) {
+          voicesPath = v;
+          $("#dub-voices").textContent = v;
+        } else {
+          $("#dub-voices").textContent = "未选择（该会话无 voices.json）";
+        }
+      } catch (e) {
+        $("#dub-voices").textContent = "读取失败（请检查 voices.json）";
+        toast("读取会话 voices.json 失败: " + (e as Error).message, true);
       }
       renderTable();
     } catch (e) { toast((e as Error).message, true); }
@@ -360,13 +385,35 @@ export function initDubbing() {
       await call(Dubber.saveTimelineFile(reviewed, JSON.stringify(tl, null, 2)));
     } catch (e) { return toast((e as Error).message, true); }
     if (!voicesPath) {
-      voicesPath = outDir ? outDir + "/voices.json" : "";
-      if (voicesPath) {
-        await Dubber.saveTextFile(voicesPath, await Dubber.defaultVoices());
-        $("#dub-voices").textContent = voicesPath + "（默认模板，可编辑）";
+      const candidate = outDir ? outDir + "/voices.json" : "";
+      if (!candidate) return toast("先选择 voices.json", true);
+      let loaded: TextFileRead;
+      try {
+        loaded = await call<TextFileRead>(Dubber.loadTextFile(candidate));
+      } catch (e) {
+        return toast("读取 voices.json 失败: " + (e as Error).message, true);
+      }
+      if (loaded.exists) {
+        voicesPath = candidate;
+        $("#dub-voices").textContent = candidate;
+      } else {
+        let confirmed: boolean;
+        try {
+          confirmed = await call<boolean>(Dubber.confirm(
+            "创建默认声线配置", "此会话尚无 voices.json。是否创建默认声线模板？"));
+        } catch (e) {
+          return toast("确认创建失败: " + (e as Error).message, true);
+        }
+        if (!confirmed) return;
+        try {
+          await call(Dubber.createTextFileIfMissing(candidate, await Dubber.defaultVoices()));
+        } catch (e) {
+          return toast("创建默认 voices.json 失败: " + (e as Error).message, true);
+        }
+        voicesPath = candidate;
+        $("#dub-voices").textContent = candidate + "（默认模板，可编辑）";
       }
     }
-    if (!voicesPath) return toast("先选 voices.json", true);
     const btn = $("#dub-render") as HTMLButtonElement;
     btn.disabled = true; btn.textContent = "渲染中…";
     try {

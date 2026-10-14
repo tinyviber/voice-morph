@@ -126,6 +126,17 @@ export const Dubber = {
   analyze(audio: string, script: string, outDir: string, modelDir: string): Promise<string> {
     return call("Dubber.Analyze", audio, script, outDir, modelDir);
   },
+  /** Confirm reports whether the user accepted a native yes/no prompt. */
+  confirm(title: string, content: string): Promise<string> {
+    return call("Dubber.Confirm", title, content);
+  },
+  /**
+   * CreateTextFileIfMissing creates a UTF-8 text file without replacing an
+   * existing file. O_EXCL makes the existence check and creation one operation.
+   */
+  createTextFileIfMissing(path: string, payload: string): Promise<string> {
+    return call("Dubber.CreateTextFileIfMissing", path, payload);
+  },
   /** DefaultVoices returns a starter voices.json for the session. */
   defaultVoices(): Promise<string> {
     return call("Dubber.DefaultVoices");

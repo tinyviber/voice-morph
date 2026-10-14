@@ -166,9 +166,12 @@ func (d *Dubber) ReadFileB64(path string) string {
 func (d *Dubber) LoadTextFile(path string) string {
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return ""
+		if os.IsNotExist(err) {
+			return okJSON(map[string]any{"exists": false})
+		}
+		return errJSON(err)
 	}
-	return string(b)
+	return okJSON(map[string]any{"exists": true, "text": string(b)})
 }
 
 // SaveTextFile writes a UTF-8 text file atomically.
@@ -177,6 +180,37 @@ func (d *Dubber) SaveTextFile(path, payload string) string {
 		return errJSON(err)
 	}
 	return okJSON(map[string]string{"saved": path})
+}
+
+// CreateTextFileIfMissing creates a UTF-8 text file without replacing an
+// existing file. O_EXCL makes the existence check and creation one operation.
+func (d *Dubber) CreateTextFileIfMissing(path, payload string) string {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		return errJSON(err)
+	}
+	if _, err := f.WriteString(payload); err != nil {
+		_ = f.Close()
+		_ = os.Remove(path)
+		return errJSON(err)
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(path)
+		return errJSON(err)
+	}
+	return okJSON(map[string]string{"created": path})
+}
+
+// Confirm reports whether the user accepted a native yes/no prompt.
+func (d *Dubber) Confirm(title, content string) string {
+	result, err := mygo.Dialog.Message(mygo.MessageOptions{
+		Type: mygo.MessageQuestion, Title: title, Message: content,
+		Buttons: []string{"取消", "创建"}, DefaultButton: 0, CancelButton: 0,
+	})
+	if err != nil {
+		return errJSON(err)
+	}
+	return okJSON(result.Button == 1)
 }
 
 // DefaultVoices returns a starter voices.json for the session.

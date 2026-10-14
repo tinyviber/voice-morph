@@ -166,16 +166,19 @@ func newSegIndex(t *Timeline) *segIndex {
 }
 
 // resolve finds the unique counterpart of s in the index. Identity:
-// segment_id exact (line must also match when requireLine); else
+// segment_id exact only when the ASR source, raw text, and time interval
+// still agree; otherwise
 // asr_ref candidates — or, for segments with no asr ref, same-line
-// candidates — narrowed by ±2s start drift and a normalized-text
-// prefix anchor. The anchor compares ASRRaw (immutable as-recognized
-// text) before falling back to SpokenText, so a heavy human rewrite
-// can't break identity. Exactly one candidate wins; zero or several
+// candidates — narrowed by close, overlapping time intervals and a
+// normalized-text prefix anchor. The anchor compares ASRRaw (immutable
+// as-recognized text) before falling back to SpokenText, so a heavy human
+// rewrite can't break identity. Exactly one candidate wins; zero or several
 // means "don't know" and the caller leaves the segment pending.
 func (x *segIndex) resolve(s TimelineSegment, requireLine bool) (int, bool) {
 	if j, ok := x.byID[s.SegmentID]; ok &&
-		(!requireLine || x.segs[j].LineID == s.LineID) {
+		(!requireLine || x.segs[j].LineID == s.LineID) &&
+		segmentIdentityEvidenceMatches(s, x.segs[j]) &&
+		identityIntervalsOverlap(s, x.segs[j]) {
 		return j, true
 	}
 	anchor := func(s TimelineSegment) string {
@@ -191,7 +194,7 @@ func (x *segIndex) resolve(s TimelineSegment, requireLine bool) (int, bool) {
 		if requireLine && r.LineID != s.LineID {
 			return
 		}
-		if absInt(r.StartMs-s.StartMs) > 2000 {
+		if !identityIntervalsOverlap(s, r) {
 			return
 		}
 		rn := anchor(r)
@@ -215,6 +218,36 @@ func (x *segIndex) resolve(s TimelineSegment, requireLine bool) (int, bool) {
 	return 0, false
 }
 
+func segmentIdentityEvidenceMatches(a, b TimelineSegment) bool {
+	if a.ASRSegmentID != b.ASRSegmentID {
+		return false
+	}
+	if a.ASRRaw != "" || b.ASRRaw != "" {
+		return a.ASRRaw != "" && b.ASRRaw != "" && normText(a.ASRRaw) == normText(b.ASRRaw)
+	}
+	return normText(a.SpokenText) != "" && normText(a.SpokenText) == normText(b.SpokenText)
+}
+
+func identityIntervalsOverlap(a, b TimelineSegment) bool {
+	if absInt(a.StartMs-b.StartMs) > 2000 || absInt(a.EndMs-b.EndMs) > 2000 {
+		return false
+	}
+	start := a.StartMs
+	if b.StartMs > start {
+		start = b.StartMs
+	}
+	end := a.EndMs
+	if b.EndMs < end {
+		end = b.EndMs
+	}
+	overlap := end - start
+	shorter := a.EndMs - a.StartMs
+	if duration := b.EndMs - b.StartMs; duration < shorter {
+		shorter = duration
+	}
+	return shorter > 0 && overlap*2 >= shorter
+}
+
 func takeGroups(t *Timeline) map[string][]TimelineSegment {
 	g := map[string][]TimelineSegment{}
 	for _, s := range t.Segments {
@@ -227,4 +260,3 @@ func takeGroups(t *Timeline) map[string][]TimelineSegment {
 	}
 	return g
 }
-

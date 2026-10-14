@@ -125,6 +125,9 @@ func Render(opts RenderOptions) (*Manifest, error) {
 	if err := tl.Validate(); err != nil {
 		return nil, fmt.Errorf("timeline invalid: %w", err)
 	}
+	if err := validateTakeSelection(tl); err != nil {
+		return nil, err
+	}
 	voices, err := LoadVoices(opts.VoicesPath)
 	if err != nil {
 		return nil, fmt.Errorf("voices: %w", err)
@@ -520,6 +523,38 @@ func selectedForRender(tl *Timeline, only map[string]bool) []TimelineSegment {
 		out = append(out, s)
 	}
 	return out
+}
+
+func validateTakeSelection(tl *Timeline) error {
+	type lineSelection struct {
+		take    string
+		nonTake string
+	}
+	selected := make(map[string]lineSelection)
+	for _, s := range tl.Segments {
+		if !s.Selected || s.LineID == "" {
+			continue
+		}
+		choice := selected[s.LineID]
+		if s.TakeIndex > 0 {
+			if choice.take != "" {
+				return fmt.Errorf("line %s has multiple selected takes: %s and %s", s.LineID, choice.take, s.SegmentID)
+			}
+			if choice.nonTake != "" {
+				return fmt.Errorf("line %s selects take %s alongside segment %s", s.LineID, s.SegmentID, choice.nonTake)
+			}
+			choice.take = s.SegmentID
+		} else {
+			if choice.take != "" {
+				return fmt.Errorf("line %s selects take %s alongside segment %s", s.LineID, choice.take, s.SegmentID)
+			}
+			if choice.nonTake == "" {
+				choice.nonTake = s.SegmentID
+			}
+		}
+		selected[s.LineID] = choice
+	}
+	return nil
 }
 
 func minInt(a, b int) int {
