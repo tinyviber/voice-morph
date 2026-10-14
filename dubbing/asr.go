@@ -128,20 +128,34 @@ func (d *ASRDoc) Validate() error {
 var sentEndRunes = map[rune]bool{'。': true, '！': true, '？': true,
 	'!': true, '?': true, '；': true, ';': true, '…': true}
 
+// PauseGapMs is the word-timestamp gap treated as a sentence break
+// when punctuation is absent (ASR can drop 句末标点 entirely).
+const PauseGapMs = 600
+
 // SplitFusedSegments cuts segments that fused several sentences (a
-// non-VAD backend can return one segment per whole chunk) at terminal
-// punctuation so the block matcher — capped at a few lines per block —
-// sees sentence-level input. Word-timestamp groups produce measured
-// bounds; text-only splits stay coarse. Segments with no punctuation
-// or only one sentence pass through untouched.
+// non-VAD backend can return one segment per whole chunk) so the block
+// matcher — capped at a few lines per block — sees sentence-level
+// input. Splits happen at terminal punctuation and, secondarily, at
+// word-timestamp pauses ≥ PauseGapMs. Word-derived bounds are
+// measured; every proportional text cut stays Coarse (a parent's real
+// edges never legitimize an estimated interior cut). Segments that
+// resist splitting pass through for the caller to degrade honestly.
 func SplitFusedSegments(segs []ASRSegment) []ASRSegment {
 	var out []ASRSegment
 	for _, s := range segs {
 		if len(s.Words) > 1 {
 			var groups [][]ASRWord
 			var cur []ASRWord
+			prevEnd := -1
 			for _, w := range s.Words {
+				// A long inter-word silence is a sentence boundary even
+				// without punctuation.
+				if prevEnd >= 0 && len(cur) > 0 && w.StartMs-prevEnd >= PauseGapMs {
+					groups = append(groups, cur)
+					cur = nil
+				}
 				cur = append(cur, w)
+				prevEnd = w.EndMs
 				for _, r := range w.Text {
 					if sentEndRunes[r] {
 						groups = append(groups, cur)
@@ -174,8 +188,9 @@ func SplitFusedSegments(segs []ASRSegment) []ASRSegment {
 				continue
 			}
 		}
-		// Text-only fallback: split at punctuation, proportional bounds,
-		// keep the coarse flag (times are estimates).
+		// Text-only fallback: split at punctuation, proportional bounds.
+		// These interior cuts are estimates even when the parent's
+		// outer bounds were measured — mark every piece coarse.
 		rs := []rune(s.Text)
 		var parts [][]rune
 		var cur []rune
@@ -208,6 +223,7 @@ func SplitFusedSegments(segs []ASRSegment) []ASRSegment {
 			sub.Text = string(p)
 			sub.Words = nil
 			sub.StartMs, sub.EndMs = lo, hi
+			sub.Coarse = true // proportional cut: always an estimate
 			out = append(out, sub)
 		}
 	}

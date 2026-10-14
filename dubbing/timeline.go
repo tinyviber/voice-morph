@@ -93,6 +93,9 @@ type UnmatchedLine struct {
 	RoleID  string `json:"role_id"`
 	Text    string `json:"text"`
 	Reason  string `json:"reason"` // e.g. "no_audio"
+	// Optional marks a line the user intentionally leaves without audio;
+	// without it the render status downgrades to "partial".
+	Optional bool `json:"optional,omitempty"`
 }
 
 // Timeline is the versioned reconciliation document (timeline.json). It

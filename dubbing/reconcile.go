@@ -183,6 +183,22 @@ func Reconcile(script *Script, asr *ASRDoc, opts ReconcileOptions) (*Timeline, e
 // alignBlocks finds the minimum-cost partition of lines×segs into
 // matched/skipped blocks. Costs: match = (1-sim)+MergePenalty*(di-1+dk-1),
 // skipped line = SkipLineCost, skipped segment = SkipSegCost.
+// boundless reports whether a segment cannot be split into sentences:
+// no word timestamps AND no terminal punctuation. A boundless fused
+// segment is allowed to host more than MaxLinesPerBlock lines —
+// otherwise every extra line would be falsely reported as unread.
+func boundless(s normSeg) bool {
+	if len(s.seg.Words) > 0 {
+		return false
+	}
+	for _, r := range s.seg.Text {
+		if sentEndRunes[r] {
+			return false
+		}
+	}
+	return true
+}
+
 func alignBlocks(lines []normLine, segs []normSeg, opts ReconcileOptions) []block {
 	n, m := len(lines), len(segs)
 	W := m + 1
@@ -216,8 +232,12 @@ func alignBlocks(lines []normLine, segs []normSeg, opts ReconcileOptions) []bloc
 				continue
 			}
 			// match blocks
-			for di := 1; di <= opts.MaxLinesPerBlock && i+di <= n; di++ {
-				for dk := 1; dk <= opts.MaxSegsPerBlock && k+dk <= m; dk++ {
+			for dk := 1; dk <= opts.MaxSegsPerBlock && k+dk <= m; dk++ {
+				diCap := opts.MaxLinesPerBlock
+				if dk == 1 && boundless(segs[k]) {
+					diCap = 64 // unsplittable fused seg: degrade, don't drop
+				}
+				for di := 1; di <= diCap && i+di <= n; di++ {
 					nc := c + matchCost(i, di, k, dk)
 					cell := (i+di)*W + (k + dk)
 					if nc < cost[cell] {
@@ -407,6 +427,14 @@ func max3(a, b, c int) int {
 // unmatched (they carry mostly foreign audio).
 func emitBlock(t *Timeline, bl []normLine, bs []normSeg, i0, k0 int,
 	opts ReconcileOptions, unmatched *[]int, segEmitted []bool, lineBound []bool) {
+
+	for _, s := range bs {
+		if boundless(s) {
+			t.Warnings = append(t.Warnings, fmt.Sprintf(
+				"%s: 融合段无标点/词时间戳不可切分，按字符对齐降级——内部边界全为估计",
+				s.seg.SegmentID))
+		}
+	}
 
 	// Concat streams with owner maps.
 	var A, B []rune

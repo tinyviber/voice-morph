@@ -488,3 +488,98 @@ func TestReconcile_LongRecordingFused(t *testing.T) {
 		t.Fatalf("%d recognized lines wrongly unmatched", len(tl.UnmatchedLines))
 	}
 }
+
+// No-punctuation fused segment WITH word timestamps: the ASR dropped
+// every 。 but the ~1s silence between utterances must still cut it
+// into sentence pieces at the word-timestamp pauses.
+func TestReconcile_FusedNoPunctPauses(t *testing.T) {
+	const nLines = 60
+	var lines []ScriptLine
+	var full strings.Builder
+	var words []ASRWord
+	pos := 0
+	for i := 0; i < nLines; i++ {
+		text := fmt.Sprintf("这是第%d句对白内容", i)
+		lines = append(lines, ScriptLine{LineID: fmt.Sprintf("l%02d", i+1),
+			SceneID: "s1", RoleID: "narrator", Text: text})
+		runes := []rune(text)
+		for j, r := range runes {
+			words = append(words, ASRWord{Text: string(r),
+				StartMs: pos + j*350, EndMs: pos + j*350 + 330})
+		}
+		full.WriteString(text) // NO punctuation at all
+		pos = pos + len(runes)*350 + 1100 // 1.1s inter-sentence silence
+	}
+	doc := &ASRDoc{Version: 1, Audio: "long.wav", SampleRate: 48000,
+		DurationMs: pos,
+		Segments: []ASRSegment{{SegmentID: "fused-1", StartMs: 0,
+			EndMs: pos, Text: full.String(), Words: words, Coarse: true}}}
+	spl := SplitFusedSegments(doc.Segments)
+	if len(spl) != nLines {
+		t.Fatalf("pause-split produced %d segments, want %d", len(spl), nLines)
+	}
+	tl, err := Reconcile(&Script{Version: 1, Lines: lines}, doc, DefaultReconcileOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	bound := map[string]bool{}
+	for _, s := range tl.Segments {
+		if s.LineID != "" && s.Selected {
+			bound[s.LineID] = true
+		}
+	}
+	if len(bound) != nLines || len(tl.UnmatchedLines) != 0 {
+		t.Fatalf("bound %d/%d unmatched_lines=%d", len(bound), nLines, len(tl.UnmatchedLines))
+	}
+}
+
+// Fully boundless fused segment — no punctuation AND no word
+// timestamps. Splitting is impossible; instead of reporting 56 lines
+// as no_audio, the matcher must degrade: bind the lines inside the
+// giant segment, mark every interior boundary estimated (review
+// required), and warn on the timeline.
+func TestReconcile_FusedBoundless(t *testing.T) {
+	const nLines = 60
+	var lines []ScriptLine
+	var full strings.Builder
+	for i := 0; i < nLines; i++ {
+		text := fmt.Sprintf("这是第%d句对白内容", i)
+		lines = append(lines, ScriptLine{LineID: fmt.Sprintf("l%02d", i+1),
+			SceneID: "s1", RoleID: "narrator", Text: text})
+		full.WriteString(text)
+	}
+	doc := &ASRDoc{Version: 1, Audio: "long.wav", SampleRate: 48000,
+		DurationMs: 480000,
+		Segments: []ASRSegment{{SegmentID: "fused-1", StartMs: 0,
+			EndMs: 480000, Text: full.String(), Coarse: true}}}
+	spl := SplitFusedSegments(doc.Segments)
+	if len(spl) != 1 {
+		t.Fatalf("boundless seg must survive splitting, got %d", len(spl))
+	}
+	tl, err := Reconcile(&Script{Version: 1, Lines: lines}, doc, DefaultReconcileOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	bound := map[string]bool{}
+	estimated := 0
+	for _, s := range tl.Segments {
+		if s.LineID != "" && s.Selected {
+			bound[s.LineID] = true
+		}
+		for _, r := range s.ReviewReasons {
+			if r == ReviewEstimatedBoundary {
+				estimated++
+			}
+		}
+	}
+	if len(bound) != nLines {
+		t.Fatalf("boundless fused seg dropped lines: bound %d/%d unmatched_lines=%d",
+			len(bound), nLines, len(tl.UnmatchedLines))
+	}
+	if len(tl.Warnings) == 0 {
+		t.Fatal("boundless degradation must warn on the timeline")
+	}
+	if estimated == 0 {
+		t.Fatal("boundless pieces must carry estimated_boundary")
+	}
+}

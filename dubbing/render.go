@@ -51,7 +51,9 @@ type Manifest struct {
 	AudioSHA256 string           `json:"audio_sha256"`
 	SampleRate int               `json:"sample_rate"`
 	DurationMs int64             `json:"duration_ms"`
-	Status     string            `json:"status"` // "ok"|"failed"
+	Status     string            `json:"status"` // complete|blocked_review|partial|failed
+	// Counts gives consumers structured reasons without parsing skipped[].
+	Counts     map[string]int    `json:"counts,omitempty"`
 	Lines      []ManifestLine    `json:"lines"`
 	Skipped    []ManifestSkip    `json:"skipped,omitempty"`
 	Failures   []ManifestFailure `json:"failures,omitempty"`
@@ -199,6 +201,13 @@ func Render(opts RenderOptions) (*Manifest, error) {
 	}
 	for _, l := range tl.UnmatchedLines {
 		m.Skipped = append(m.Skipped, ManifestSkip{ID: l.LineID, Reason: "script line has no audio"})
+		if !l.Optional {
+			// A script line that was never read is a real gap in the
+			// deliverable — complete would silently ship a video
+			// missing dialogue. Only an explicit optional marker
+			// excuses it.
+			partialLoss = true
+		}
 	}
 
 	// Boundary refinement is sequential so neighbors never overlap.
@@ -302,7 +311,7 @@ func Render(opts RenderOptions) (*Manifest, error) {
 		}
 		srcName := ""
 		if opts.WriteSrc {
-			srcName = fmt.Sprintf("lines/src-%s.wav", safeFileName(j.seg.SegmentID))
+			srcName = fmt.Sprintf("lines/src-%s.wav", uniqueFileName(j.seg.SegmentID))
 			if err := SaveWAV(joinOut(out, srcName), slice(src, cuts[i].a, cuts[i].b)); err != nil {
 				m.Warnings = append(m.Warnings, srcName+": "+err.Error())
 				srcName = ""
@@ -336,7 +345,7 @@ func Render(opts RenderOptions) (*Manifest, error) {
 	}
 	sort.Strings(roleIDs)
 	for _, r := range roleIDs {
-		name := "roles/" + safeFileName(r) + ".wav"
+		name := "roles/" + uniqueFileName(r) + ".wav"
 		if err := SaveWAV(joinOut(out, name), roleBuf[r]); err != nil {
 			return nil, err
 		}
@@ -382,15 +391,29 @@ func Render(opts RenderOptions) (*Manifest, error) {
 		}
 	}
 	// Status semantics an automated consumer can trust: "complete" only
-	// when every selected line rendered; "blocked_review" when selected
-	// lines were skipped solely for missing human review; "partial" for
-	// other selected-line gaps; "failed" on render failures.
+	// when every selected line rendered AND no required script line is
+	// missing audio; "partial" outranks "blocked_review" — when both
+	// apply, review alone won't close the gap.
+	m.Counts = map[string]int{
+		"rendered": len(m.Lines), "failures": len(m.Failures),
+		"blocked_review": 0, "missing_lines": 0, "unselected_takes": 0,
+	}
+	for _, s := range m.Skipped {
+		switch {
+		case strings.HasPrefix(s.Reason, "unreviewed anomaly"):
+			m.Counts["blocked_review"]++
+		case s.Reason == "script line has no audio":
+			m.Counts["missing_lines"]++
+		case s.Reason == "take not selected":
+			m.Counts["unselected_takes"]++
+		}
+	}
 	if m.Status != "failed" {
 		switch {
-		case blockedReview:
-			m.Status = "blocked_review"
 		case partialLoss:
 			m.Status = "partial"
+		case blockedReview:
+			m.Status = "blocked_review"
 		default:
 			m.Status = "complete"
 		}
@@ -405,6 +428,17 @@ func cacheKey(seg TimelineSegment, c struct{ a, b int }, audioSHA string, p engi
 		p.Bypass, p.Speech, p.PitchRange, p.TargetF0, p.EqPre, p.EqPost)
 	fmt.Fprintf(h, "|%.6f", p.FormantShape)
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+// uniqueFileName is the collision-proof name for a raw id: sanitized
+// form + hash of the RAW id, ALWAYS appended — sanitized names collide
+// on cleaned characters ("hero."→"hero") and on case-insensitive
+// filesystems ("Narrator"/"narrator"). Use for role tracks and src
+// windows; rendered line wavs stay collision-safe through the
+// per-content key suffix.
+func uniqueFileName(s string) string {
+	h := sha256.Sum256([]byte(s))
+	return fmt.Sprintf("%s-%x", safeFileName(s), h[:4])
 }
 
 // safeFileName maps an arbitrary id to a unique filesystem-safe

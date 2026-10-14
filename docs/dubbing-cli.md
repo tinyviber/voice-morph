@@ -64,16 +64,23 @@ manifest。
 显式放行但逐段记 `warnings`。只改文本/角色/勾选置 `edited` 不放行——
 审核必须走显式确认。
 
-**manifest.status**（下游可机读）：`complete`=所有选中行都已渲染；
-`blocked_review`=有选中行仅因待审核被跳过（只差人审）；`partial`=
-其他选中行缺失；`failed`=有渲染失败。CLI `ok` 与退出码跟着 status 走
-（complete→true/0，其余→false/1）。
+**manifest.status**（下游可机读）：`complete`=所有选中行都已渲染且无
+未补录的台本行；`blocked_review`=有选中行仅因待审核被跳过；
+`partial`=有缺失——整句漏读（`unmatched_lines` 未标 `optional:true`）
+或其他选中行未渲染，**优先级高于 blocked_review**（审核补不回没录的音）；
+`failed`=有渲染失败。`manifest.counts` 给结构化计数
+（rendered/failures/blocked_review/missing_lines/unselected_takes）。
+CLI `ok` 与退出码跟着 status 走（complete→true/0，其余→false/1）。
+台本行确属有意不录时，在 timeline-reviewed.json 的 `unmatched_lines`
+里给该行加 `optional:true`——渲染不再降级，skipped 仍如实记录。
 
 缓存真实生效：同 seg/切点/音频/参数的行 WAV 已存在且解码长度正确时
 直接复用（`cache_hit:true`），参数或切点变化自动失配；缓存键用实际
 读到的音频 SHA256，缺声明的时间线也偷不了缓存。文件名安全：
-`role_id`/`segment_id` 只取 [A-Za-z0-9\-_.]，折叠过的 id 追加原 id
-hash8——中文角色名不会互撞，恶意 id 也不可能把产物写出输出目录。
+`role_id`/`segment_id` 只取 [A-Za-z0-9\-_.] 再统一追加原 id hash8
+（`roles/<slug>-<hash8>.wav`、`lines/src-<slug>-<hash8>.wav`）——
+中文名、`hero.`/`hero`、`Narrator`/`narrator`（大小写不敏感文件系统）
+都不会互撞，恶意 id 也不可能把产物写出输出目录。
 
 ## manifest.json 结构
 
@@ -91,7 +98,9 @@ hash8——中文角色名不会互撞，恶意 id 也不可能把产物写出�
   "extra": { /* RenderOptions.Extra 透传槽，下游可写 */ },
   "skipped": [{"id":"seg-0004","reason":"take not selected"},
               {"id":"l04","reason":"script line has no audio"}],
-  "failures": [], "roles": {"narrator":"roles/narrator.wav"},
+  "failures": [], "roles": {"narrator":"roles/narrator-a1b2c3d4.wav"},
+  "counts": {"rendered":3,"failures":0,"blocked_review":0,
+             "missing_lines":0,"unselected_takes":1},
   "mix": "mix.wav", "subtitles": "subtitles.srt",
   "subtitle_json": "subtitles.json", "warnings": []
 }

@@ -289,6 +289,9 @@ def _segments_from_result(res, offset_ms, want_words, duration_ms=0):
 
 
 _SENT_END = set("。！？!?；;…")
+# Inter-word silence treated as a sentence boundary when punctuation is
+# absent; must mirror dubbing.PauseGapMs.
+_PAUSE_MS = 600.0
 
 
 def _split_fused_sentences(segs):
@@ -328,12 +331,23 @@ def _split_fused_sentences(segs):
                 sub["text"] = _rich_clean(ptxt)
                 sub["text_raw"] = ptxt
                 sub["start_ms"], sub["end_ms"] = lo, hi
+                # Interior cuts are proportional estimates even when the
+                # parent's outer bounds were measured — always coarse.
+                sub["coarse"] = True
                 out.append(sub)
             continue
-        # Word-level split: group words at sentence-ending punctuation.
+        # Word-level split: group words at sentence-ending punctuation,
+        # secondarily at inter-word pauses >= _PAUSE_MS (ASR can drop
+        # punctuation entirely; the silence still betrays the boundary).
         groups, cur = [], []
+        prev_end = None
         for w in words:
+            if (prev_end is not None and cur
+                    and float(w.get("start_ms") or 0) - prev_end >= _PAUSE_MS):
+                groups.append(cur)
+                cur = []
             cur.append(w)
+            prev_end = float(w.get("end_ms") or 0)
             if any(c in _SENT_END for c in str(w["text"])):
                 groups.append(cur)
                 cur = []

@@ -299,6 +299,11 @@ export function initDubbing() {
     btn.disabled = true; btn.textContent = "渲染中…";
     try {
       manifest = await call(Dubber.render(reviewed, voicesPath, outDir + "/rendered"));
+      // Re-render overwrote files under the same paths — the decoded
+      // buffers cached by playRange would keep serving the old audio.
+      const renderPrefix = outDir + "/rendered/";
+      for (const k of [...audioBufs.keys()])
+        if (k.startsWith(renderPrefix)) audioBufs.delete(k);
       renderManifest();
       const fails = manifest.failures?.length ?? 0;
       const skips = manifest.skipped?.length ?? 0;

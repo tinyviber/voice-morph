@@ -54,10 +54,14 @@ VoiceMorph 的第二个工作区：**录音是事实来源，台本只是参考*
 
 确定性算法，无 LLM 依赖（语义相似度只允许作加分项，不能推翻顺序约束）：
 
-0. **融合段预切**：`SplitFusedSegments` 先按标点/词级时间戳把
-   无 VAD 的整段切成语句级段（词 ts 派生的边界不标估计）——
-   一段几十句的融合输入不会撞上块匹配的行数上限，外部 asr-raw
-   也走同一入口。
+0. **融合段预切**：`SplitFusedSegments` 先把无 VAD 的整段切成
+   语句级段：切点是句末标点，其次词级时间戳上 ≥600ms 的停顿
+   （ASR 可能整段不给标点）；词 ts 派生的边界不标估计，按比例
+   推算的内部切点一律标 `coarse`（父段的真实外边界不外推）。
+   既无标点又无词 ts 的「不可切段」不硬切——块匹配对其放宽行数
+   上限（≤64 行），产物全部 `estimated_boundary`+待审核并在
+   `timeline.warnings` 记降级说明，而不是误报大片 `no_audio`。
+   外部 asr-raw 也走同一入口。
 1. **归一化**：去标点空白、全角折半角、小写；保留原文字符索引映射，
    使切回原文取 `spoken_text` 时每个真实字符都能还原。
 2. **块级 DP**：`lines × segs` 网格上的最小代价路径，块 ≤
@@ -93,8 +97,11 @@ VoiceMorph 的第二个工作区：**录音是事实来源，台本只是参考*
    一样参与渲染。**渲染默认拦截未审核段**进 `skipped`；
    `--allow-unreviewed` 显式放行并逐段记 `manifest.warnings`。
    `manifest.status`：`complete`/`blocked_review`/`partial`/`failed`——
-   有选中行仅因待审核被跳过时报 `blocked_review`，绝不报
-   无条件成功。
+   整句漏读（`unmatched_lines` 非空）报 `partial`，仅当人工在
+   timeline 将该行标 `optional:true` 才豁免；`partial` 优先级高于
+   `blocked_review`（缺失音频靠审核补不回来）。`manifest.counts`
+   给出结构化原因计数（rendered/failures/blocked_review/
+   missing_lines/unselected_takes），agent 无需解析 skipped 文案。
 
 ## C. 渲染（render）
 

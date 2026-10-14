@@ -387,3 +387,120 @@ func TestSafeFileName_NoCollisions(t *testing.T) {
 		t.Fatalf("ascii id mangled: %q", got)
 	}
 }
+
+// uniqueFileName hashes the RAW id unconditionally, so pairs that fold
+// to identical or case-equal file names still can't collide —
+// "hero."/"hero" on any FS and "Narrator"/"narrator" on a
+// case-insensitive one.
+func TestUniqueFileName_NoCollisions(t *testing.T) {
+	pairs := [][2]string{
+		{"hero", "hero."},
+		{"Narrator", "narrator"},
+		{"悟空", "布玛"},
+		{"../evil", "evil"},
+	}
+	for _, p := range pairs {
+		a, b := uniqueFileName(p[0]), uniqueFileName(p[1])
+		if a == b {
+			t.Fatalf("%q and %q collide at %q", p[0], p[1], a)
+		}
+		if strings.ContainsAny(a, "/\\") || a == "" {
+			t.Fatalf("%q -> unsafe %q", p[0], a)
+		}
+	}
+	if !strings.HasPrefix(uniqueFileName("narrator"), "narrator-") {
+		t.Fatalf("ascii name lost readability: %q", uniqueFileName("narrator"))
+	}
+}
+
+// A script line that was never read must downgrade the manifest to
+// "partial" — "complete" would tell a downstream agent the whole job
+// shipped while dialogue is missing. optional:true excuses it.
+func TestRender_MissingLineIsPartial(t *testing.T) {
+	dir := t.TempDir()
+	src := synthSpeech(4000, [][2]int{{500, 1500}})
+	audioPath := filepath.Join(dir, "take.wav")
+	writeWAV(t, audioPath, src)
+	sha, _ := SHA256File(audioPath)
+	mk := func(optional bool) *Timeline {
+		return &Timeline{
+			Version: SchemaVersion, Audio: audioPath, AudioSHA256: sha,
+			SampleRate: engine.SampleRate, DurationMs: 4000,
+			Segments: []TimelineSegment{
+				{SegmentID: "seg-0001", LineID: "l01", RoleID: "narrator", SpokenText: "你好",
+					ASRRaw: "你好", StartMs: 500, EndMs: 1500, MatchStatus: MatchExact, Selected: true},
+			},
+			UnmatchedLines: []UnmatchedLine{
+				{LineID: "l30", RoleID: "narrator", Text: "漏读的一句", Reason: "no_audio", Optional: optional},
+			},
+		}
+	}
+	tlPath := filepath.Join(dir, "timeline.json")
+	voicesPath := filepath.Join(dir, "voices.json")
+	os.WriteFile(voicesPath, []byte(`{"version":1,"voices":{"narrator":{"backend":"dsp","preset":"normal"}}}`), 0o644)
+	if err := SaveJSON(tlPath, mk(false)); err != nil {
+		t.Fatal(err)
+	}
+	m, err := Render(RenderOptions{TimelinePath: tlPath, VoicesPath: voicesPath, OutDir: filepath.Join(dir, "out")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Status != "partial" {
+		t.Fatalf("missing line must yield partial, got %s", m.Status)
+	}
+	if m.Counts["missing_lines"] != 1 {
+		t.Fatalf("counts must attribute the gap: %+v", m.Counts)
+	}
+	if err := SaveJSON(tlPath, mk(true)); err != nil {
+		t.Fatal(err)
+	}
+	m, err = Render(RenderOptions{TimelinePath: tlPath, VoicesPath: voicesPath, OutDir: filepath.Join(dir, "out2")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Status != "complete" {
+		t.Fatalf("optional missing line must not downgrade, got %s", m.Status)
+	}
+}
+
+// When review-blocked skips AND missing lines coexist the status must
+// be "partial": reviewing alone cannot recover audio that was never
+// recorded.
+func TestRender_PartialOutranksBlockedReview(t *testing.T) {
+	dir := t.TempDir()
+	src := synthSpeech(4000, [][2]int{{500, 1500}, {2500, 3500}})
+	audioPath := filepath.Join(dir, "take.wav")
+	writeWAV(t, audioPath, src)
+	sha, _ := SHA256File(audioPath)
+	tl := &Timeline{
+		Version: SchemaVersion, Audio: audioPath, AudioSHA256: sha,
+		SampleRate: engine.SampleRate, DurationMs: 4000,
+		Segments: []TimelineSegment{
+			{SegmentID: "seg-0001", LineID: "l01", RoleID: "narrator", SpokenText: "你好",
+				ASRRaw: "你好", StartMs: 500, EndMs: 1500, MatchStatus: MatchExact, Selected: true},
+			{SegmentID: "seg-0002", LineID: "l02", RoleID: "narrator", SpokenText: "在吗",
+				ASRRaw: "在吗", StartMs: 2500, EndMs: 3500, MatchStatus: MatchModified,
+				Selected: true, ReviewRequired: true,
+				ReviewReasons: []string{ReviewLowSimilarity}},
+		},
+		UnmatchedLines: []UnmatchedLine{
+			{LineID: "l30", RoleID: "narrator", Text: "漏读的一句", Reason: "no_audio"},
+		},
+	}
+	tlPath := filepath.Join(dir, "timeline.json")
+	voicesPath := filepath.Join(dir, "voices.json")
+	os.WriteFile(voicesPath, []byte(`{"version":1,"voices":{"narrator":{"backend":"dsp","preset":"normal"}}}`), 0o644)
+	if err := SaveJSON(tlPath, tl); err != nil {
+		t.Fatal(err)
+	}
+	m, err := Render(RenderOptions{TimelinePath: tlPath, VoicesPath: voicesPath, OutDir: filepath.Join(dir, "out")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Status != "partial" {
+		t.Fatalf("partial must outrank blocked_review, got %s", m.Status)
+	}
+	if m.Counts["blocked_review"] != 1 || m.Counts["missing_lines"] != 1 {
+		t.Fatalf("counts must separate the two causes: %+v", m.Counts)
+	}
+}
