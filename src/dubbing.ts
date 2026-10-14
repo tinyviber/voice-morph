@@ -22,6 +22,7 @@ interface TimelineSeg {
   selected: boolean;
   boundary?: string;
   edited?: boolean;
+  reviewed?: boolean;
 }
 interface Timeline {
   version: number;
@@ -45,7 +46,7 @@ let audioPath = "";
 let scriptPath = "";
 let voicesPath = "";
 let outDir = "";
-let audioBuf: AudioBuffer | null = null;
+const audioBufs = new Map<string, AudioBuffer>();
 let actx: AudioContext | null = null;
 let manifest: any = null;
 
@@ -88,14 +89,17 @@ function b64ToArrayBuffer(b64: string) {
 async function playRange(path: string, startMs?: number, endMs?: number) {
   try {
     const ctx = await ensureAudioCtx();
-    if (!audioBuf || audioPath !== path) {
+    // Buffers are cached per file — swapping between master take and
+    // rendered outputs must never replay the wrong audio.
+    let buf = audioBufs.get(path);
+    if (!buf) {
       const b64 = await Dubber.readFileB64(path);
       if (!b64) throw new Error("读不到音频文件");
-      audioBuf = await ctx.decodeAudioData(b64ToArrayBuffer(b64));
-      if (path === audioPath) audioBuf = audioBuf; // cache master
+      buf = await ctx.decodeAudioData(b64ToArrayBuffer(b64));
+      audioBufs.set(path, buf);
     }
     const src = ctx.createBufferSource();
-    src.buffer = audioBuf;
+    src.buffer = buf;
     src.connect(ctx.destination);
     const s = (startMs ?? 0) / 1000;
     const dur = endMs != null ? (endMs - (startMs ?? 0)) / 1000 : undefined;
@@ -173,25 +177,26 @@ function renderTable() {
       const s = tl!.segments[+el.dataset.i!]!;
       s.role_id = el.value;
       s.edited = true;
-      // 未匹配音频被人工分配角色 → 人工绑定，可以正常进成片
+      // 未匹配音频被人工分配角色 → 人工绑定（本身就是审核决定）
       if (s.match_status === "unmatched" && el.value) {
         s.match_status = "manual";
         s.selected = true;
         s.review_required = false;
         s.review_reasons = [];
+        s.reviewed = true;
       }
       if (el.value) {
         s.review_reasons = (s.review_reasons ?? []).filter((r) => r !== "needs_role");
-        if (!s.review_reasons.length) s.review_required = false;
+        if (!s.review_reasons.length && s.reviewed) s.review_required = false;
       }
       renderTable();
     }));
   body.querySelectorAll<HTMLElement>(".ok-seg").forEach((el) =>
     el.addEventListener("click", () => {
       const s = tl!.segments[+el.dataset.i!]!;
+      s.reviewed = true; // 显式确认才解除审核门，编辑不等于审核
       s.review_required = false;
       s.review_reasons = [];
-      s.edited = true;
       renderTable();
     }));
   body.querySelectorAll<HTMLInputElement>(".sel").forEach((el) =>
@@ -205,7 +210,7 @@ function renderTable() {
 async function pick(field: "audio" | "script" | "voices", title: string, exts: string) {
   const p = await Dubber.pickFile(title, exts);
   if (!p) return;
-  if (field === "audio") { audioPath = p; audioBuf = null; $("#dub-audio").textContent = p; }
+  if (field === "audio") { audioPath = p; audioBufs.delete(p); $("#dub-audio").textContent = p; }
   if (field === "script") { scriptPath = p; $("#dub-script").textContent = p; }
   if (field === "voices") { voicesPath = p; $("#dub-voices").textContent = p; }
 }
@@ -297,10 +302,14 @@ export function initDubbing() {
       renderManifest();
       const fails = manifest.failures?.length ?? 0;
       const skips = manifest.skipped?.length ?? 0;
-      toast(manifest.status === "ok"
-        ? `渲染完成：${manifest.lines?.length ?? 0} 段${skips ? `（${skips} 跳过）` : ""}`
-        : `渲染部分失败：${fails} 段失败，${manifest.lines?.length ?? 0} 段成功`,
-        manifest.status !== "ok");
+      const statusLabel: Record<string, string> = {
+        complete: "渲染完成", blocked_review: "有待审核未渲染",
+        partial: "部分片段缺失", failed: "渲染部分失败",
+      };
+      toast(`${statusLabel[manifest.status as string] ?? manifest.status}：`
+        + `${manifest.lines?.length ?? 0} 段成功${fails ? `，${fails} 段失败` : ""}`
+        + `${skips ? `（${skips} 跳过）` : ""}`,
+        manifest.status !== "complete");
     } catch (e) {
       toast("渲染失败: " + (e as Error).message, true);
     } finally {

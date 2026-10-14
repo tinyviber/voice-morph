@@ -383,12 +383,13 @@ func runRender(args []string, stdout, stderr io.Writer) int {
 		}
 		return fail("render", code, err)
 	}
-	r := map[string]any{"ok": m.Status == "ok", "command": "render",
+	r := map[string]any{"ok": m.Status == "complete", "command": "render",
 		"manifest": filepath.Join(*outDir, "manifest.json"),
 		"lines": len(m.Lines), "skipped": len(m.Skipped), "failures": len(m.Failures),
 		"mix": m.Mix, "roles": m.Roles, "subtitles": m.Subtitles, "warnings": m.Warnings}
+	r["status"] = m.Status
 	emitJSON(stdout, r)
-	if m.Status != "ok" {
+	if m.Status != "complete" {
 		return 1
 	}
 	return 0

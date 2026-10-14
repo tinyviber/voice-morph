@@ -78,8 +78,12 @@ type TimelineSegment struct {
 	// word timestamp) or "estimated" (interpolated inside a segment).
 	Boundary string `json:"boundary,omitempty"`
 	// Edited marks text/role/bounds touched by a human during review; it
-	// is sticky across re-renders.
+	// is sticky across re-renders. It does NOT clear review flags.
 	Edited bool `json:"edited,omitempty"`
+	// Reviewed is the explicit human confirmation that discharges
+	// ReviewRequired — only the confirm action (or a manual bind) sets
+	// it; merely editing text never counts as review.
+	Reviewed bool `json:"reviewed,omitempty"`
 }
 
 // UnmatchedLine is a script line with no detected audio.

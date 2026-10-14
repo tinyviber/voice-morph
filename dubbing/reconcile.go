@@ -108,8 +108,14 @@ func Reconcile(script *Script, asr *ASRDoc, opts ReconcileOptions) (*Timeline, e
 		n, _ := normRunes(l.Text)
 		lines[i] = normLine{line: l, norm: n}
 	}
-	segs := make([]normSeg, len(asr.Segments))
-	for k, s := range asr.Segments {
+	// Split fused (multi-sentence) ASR segments at terminal punctuation
+	// first — the block matcher caps lines per block, and one 5-minute
+	// fused segment would otherwise claim only a handful of lines while
+	// the rest look "unread". Splits are idempotent (sentence-level
+	// input passes through untouched).
+	splitSegs := SplitFusedSegments(asr.Segments)
+	segs := make([]normSeg, len(splitSegs))
+	for k, s := range splitSegs {
 		n, src := normRunes(s.Text)
 		segs[k] = normSeg{seg: s, norm: n, src: src, rs: []rune(s.Text)}
 	}

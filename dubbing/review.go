@@ -9,7 +9,8 @@ import (
 // fresh reconcile draft, keyed by (line_id, asr_ref, start within
 // 2s). Re-running ASR or reconcile never forces the reviewer to redo
 // work: role/spoken/bounds/selection carry over; draft review flags
-// are recomputed but reasons already resolved by an edit are dropped.
+// are recomputed and cleared only where the human actually confirmed
+// (Reviewed) — an edit alone never discharges review.
 // Edits are refused outright when the two files describe different
 // audio — a stale reviewed file must never graft onto another take.
 func MergeReviewed(draft, reviewed *Timeline) (*Timeline, error) {
@@ -45,7 +46,7 @@ func MergeReviewed(draft, reviewed *Timeline) (*Timeline, error) {
 				}
 			}
 		}
-		if src == nil || !src.Edited {
+		if src == nil || !(src.Edited || src.Reviewed) {
 			continue
 		}
 		s.RoleID = src.RoleID
@@ -58,9 +59,12 @@ func MergeReviewed(draft, reviewed *Timeline) (*Timeline, error) {
 		if src.MatchStatus == MatchManual {
 			s.MatchStatus = MatchManual
 		}
-		s.Edited = true
-		s.ReviewRequired = false
-		s.ReviewReasons = nil
+		s.Edited = s.Edited || src.Edited
+		if src.Reviewed {
+			s.Reviewed = true
+			s.ReviewRequired = false
+			s.ReviewReasons = nil
+		}
 		draft.Segments[i] = s
 	}
 	// Take selection by line: if the reviewed file picked a different

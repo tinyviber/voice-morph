@@ -138,17 +138,21 @@ func Render(opts RenderOptions) (*Manifest, error) {
 	if err != nil {
 		return nil, fmt.Errorf("audio: %w", err)
 	}
-	if sha, _ := SHA256File(audioPath); tl.AudioSHA256 != "" && sha != tl.AudioSHA256 {
+	// The cache key and manifest always carry the hash of the audio we
+	// actually read — a timeline that omits audio_sha256 cannot smuggle
+	// a different take past the content-addressed cache.
+	actualSHA, _ := SHA256File(audioPath)
+	if tl.AudioSHA256 != "" && actualSHA != tl.AudioSHA256 {
 		return nil, fmt.Errorf("audio sha256 与 timeline 不符（换了原始录音？）")
 	}
 	out, err := SessionDir(opts.OutDir)
 	if err != nil {
 		return nil, err
 	}
-	m := &Manifest{Version: SchemaVersion, Audio: audioPath, AudioSHA256: tl.AudioSHA256,
+	m := &Manifest{Version: SchemaVersion, Audio: audioPath, AudioSHA256: actualSHA,
 		SampleRate: engine.SampleRate, DurationMs: int64(len(src)) * 1000 / engine.SampleRate,
 		Roles: map[string]string{}, Mix: "mix.wav", Subtitles: "subtitles.srt", SubtitleJSON: "subtitles.json",
-		Status: "ok", Extra: opts.Extra}
+		Status: "complete", Extra: opts.Extra}
 
 	segs := selectedForRender(tl, opts.Only)
 	sort.SliceStable(segs, func(i, j int) bool { return segs[i].StartMs < segs[j].StartMs })
@@ -160,17 +164,20 @@ func Render(opts RenderOptions) (*Manifest, error) {
 		exp    bool
 	}
 	var jobs []job
+	blockedReview, partialLoss := false, false
 	for _, s := range segs {
 		if s.RoleID == "" || s.MatchStatus == MatchUnmatched {
 			m.Skipped = append(m.Skipped, ManifestSkip{ID: s.SegmentID, Reason: "unmatched or no role"})
+			partialLoss = true // a selected line the user asked for is missing
 			continue
 		}
-		if s.ReviewRequired && !s.Edited && !opts.AllowUnreviewed {
+		if s.ReviewRequired && !s.Reviewed && !opts.AllowUnreviewed {
 			m.Skipped = append(m.Skipped, ManifestSkip{ID: s.SegmentID,
 				Reason: "unreviewed anomaly: " + strings.Join(s.ReviewReasons, ",")})
+			blockedReview = true
 			continue
 		}
-		if s.ReviewRequired && !s.Edited {
+		if s.ReviewRequired && !s.Reviewed {
 			m.Warnings = append(m.Warnings, fmt.Sprintf("%s: rendered unreviewed (%s)",
 				s.SegmentID, strings.Join(s.ReviewReasons, ",")))
 		}
@@ -218,7 +225,7 @@ func Render(opts RenderOptions) (*Manifest, error) {
 	cacheHit := make([]bool, len(jobs))
 	wavNames := make([]string, len(jobs))
 	for i, j := range jobs {
-		key := cacheKey(j.seg, cuts[i], tl.AudioSHA256, j.params)
+		key := cacheKey(j.seg, cuts[i], actualSHA, j.params)
 		wavNames[i] = fmt.Sprintf("lines/%s-%s.wav", safeFileName(j.seg.SegmentID), key[:8])
 	}
 	if opts.Jobs < 1 {
@@ -374,6 +381,20 @@ func Render(opts RenderOptions) (*Manifest, error) {
 			m.Warnings = append(m.Warnings, fmt.Sprintf("%s: peak %.3f (post-gain clipping)", ln.Wav, p))
 		}
 	}
+	// Status semantics an automated consumer can trust: "complete" only
+	// when every selected line rendered; "blocked_review" when selected
+	// lines were skipped solely for missing human review; "partial" for
+	// other selected-line gaps; "failed" on render failures.
+	if m.Status != "failed" {
+		switch {
+		case blockedReview:
+			m.Status = "blocked_review"
+		case partialLoss:
+			m.Status = "partial"
+		default:
+			m.Status = "complete"
+		}
+	}
 	return m, SaveJSON(joinOut(out, "manifest.json"), m)
 }
 
@@ -386,12 +407,16 @@ func cacheKey(seg TimelineSegment, c struct{ a, b int }, audioSHA string, p engi
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// safeFileName maps an arbitrary id to a filesystem-safe component:
-// alnum plus -_. only, everything else collapses to _. Path traversal
-// through crafted role/segment ids cannot escape the output dir.
+// safeFileName maps an arbitrary id to a unique filesystem-safe
+// component: alnum plus -_. pass through; everything else collapses to
+// _. Whenever characters were folded (non-Latin ids like 悟空/布玛 would
+// otherwise collide at "__"), the original id's hash is appended so
+// distinct ids still map to distinct files. Path traversal through
+// crafted role/segment ids cannot escape the output dir.
 func safeFileName(id string) string {
 	b := strings.Builder{}
 	b.Grow(len(id))
+	folded := false
 	for _, r := range id {
 		switch {
 		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9',
@@ -399,10 +424,19 @@ func safeFileName(id string) string {
 			b.WriteRune(r)
 		default:
 			b.WriteByte('_')
+			folded = true
 		}
 	}
 	s := b.String()
 	s = strings.Trim(s, ".")
+	if folded {
+		h := sha256.Sum256([]byte(id))
+		if s == "" || strings.Trim(s, "_") == "" {
+			s = "f-" + hex.EncodeToString(h[:])[:8]
+		} else {
+			s = s + "-" + hex.EncodeToString(h[:])[:8]
+		}
+	}
 	if s == "" {
 		s = "_"
 	}

@@ -1,6 +1,7 @@
 package dubbing
 
 import (
+	"strings"
 	"encoding/json"
 	"math"
 	"os"
@@ -76,7 +77,7 @@ func TestRender_EndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Render: %v", err)
 	}
-	if m.Status != "ok" {
+	if m.Status != "complete" {
 		t.Fatalf("status=%s failures=%v", m.Status, m.Failures)
 	}
 	if len(m.Lines) != 3 {
@@ -215,7 +216,7 @@ func TestRender_UnreviewedGatedByDefault(t *testing.T) {
 	audioPath := filepath.Join(dir, "take.wav")
 	writeWAV(t, audioPath, src)
 	sha, _ := SHA256File(audioPath)
-	mk := func(edited bool) *Timeline {
+	mk := func(reviewed bool) *Timeline {
 		return &Timeline{
 			Version: SchemaVersion, Audio: audioPath, AudioSHA256: sha,
 			SampleRate: engine.SampleRate, DurationMs: 4000,
@@ -224,7 +225,7 @@ func TestRender_UnreviewedGatedByDefault(t *testing.T) {
 					ASRRaw: "你好", StartMs: 500, EndMs: 1500, MatchStatus: MatchExact, Selected: true},
 				{SegmentID: "seg-0002", LineID: "l02", RoleID: "narrator", SpokenText: "在吗",
 					ASRRaw: "在吗", StartMs: 2500, EndMs: 3500, MatchStatus: MatchModified,
-					Selected: true, ReviewRequired: true, Edited: edited,
+					Selected: true, ReviewRequired: true, Edited: true, Reviewed: reviewed,
 					ReviewReasons: []string{ReviewLowSimilarity}},
 			},
 		}
@@ -251,6 +252,11 @@ func TestRender_UnreviewedGatedByDefault(t *testing.T) {
 	if !found {
 		t.Fatalf("unreviewed seg not in skipped: %+v", m.Skipped)
 	}
+	// The skipped unreviewed line also downgrades status so automated
+	// consumers can't mistake a review-blocked render for success.
+	if m.Status != "blocked_review" {
+		t.Fatalf("unreviewed-selected skip should yield blocked_review, got %s", m.Status)
+	}
 	// Explicit override renders it but records a warning.
 	m, err = Render(RenderOptions{TimelinePath: tlPath, VoicesPath: voicesPath,
 		OutDir: filepath.Join(dir, "out2"), AllowUnreviewed: true})
@@ -260,7 +266,6 @@ func TestRender_UnreviewedGatedByDefault(t *testing.T) {
 	if len(m.Lines) != 2 || len(m.Warnings) == 0 {
 		t.Fatalf("--allow-unreviewed should render+warn: lines=%v warnings=%v", m.Lines, m.Warnings)
 	}
-	// Human confirmation (edited) clears the gate too.
 	if err := SaveJSON(tlPath, mk(true)); err != nil {
 		t.Fatal(err)
 	}
@@ -268,8 +273,8 @@ func TestRender_UnreviewedGatedByDefault(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(m.Lines) != 2 {
-		t.Fatalf("confirmed seg should render: %+v", m.Lines)
+	if len(m.Lines) != 2 || m.Status != "complete" {
+		t.Fatalf("confirmed seg should render complete: %+v status=%s", m.Lines, m.Status)
 	}
 }
 
@@ -361,5 +366,24 @@ func TestRender_CacheHits(t *testing.T) {
 	}
 	if len(m3.Lines) != 1 || m3.Lines[0].CacheHit {
 		t.Fatalf("param change must bust cache: %+v", m3.Lines)
+	}
+}
+
+func TestSafeFileName_NoCollisions(t *testing.T) {
+	ids := []string{"悟空", "布玛", "旁白", "../evil", "a/b", "narrator"}
+	seen := map[string]string{}
+	for _, id := range ids {
+		got := safeFileName(id)
+		if strings.ContainsAny(got, "/\\") || got == "" {
+			t.Fatalf("%q -> unsafe %q", id, got)
+		}
+		if prev, dup := seen[got]; dup {
+			t.Fatalf("%q and %q collide at %q", prev, id, got)
+		}
+		seen[got] = id
+	}
+	// Pure-ASCII ids stay readable and unchanged.
+	if got := safeFileName("narrator"); got != "narrator" {
+		t.Fatalf("ascii id mangled: %q", got)
 	}
 }

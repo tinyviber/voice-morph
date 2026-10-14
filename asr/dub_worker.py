@@ -180,6 +180,7 @@ def _norm_words(item, offset_ms=0, text_hint=""):
       - timestamp alone: [[s,e], ...] paired to text_hint characters
     All times are shifted by offset_ms (chunk reassembly)."""
     out = []
+    candidates = []
     words = item.get("words")
     ts = item.get("timestamp")
     ts_pairs = [p for p in ts or [] if isinstance(p, (list, tuple)) and len(p) >= 2]
@@ -190,6 +191,9 @@ def _norm_words(item, offset_ms=0, text_hint=""):
                 out.append({"text": str(w), "start_ms": int(s) + offset_ms,
                             "end_ms": int(e) + offset_ms})
             return out
+        logging.warning("words/timestamp length mismatch (%d vs %d); "
+                        "word timestamps dropped", len(words), len(ts_pairs))
+        return out
     elif isinstance(words, list):
         candidates = words
     elif ts_pairs:
@@ -281,7 +285,75 @@ def _segments_from_result(res, offset_ms, want_words, duration_ms=0):
         if words:
             seg["words"] = words
         segs.append(seg)
-    return segs
+    return _split_fused_sentences(segs)
+
+
+_SENT_END = set("。！？!?；;…")
+
+
+def _split_fused_sentences(segs):
+    """A non-VAD chunk can fuse dozens of utterances into one segment;
+    the Go matcher caps lines per block, so fused input loses lines.
+    Split at terminal punctuation: word-level ts give measured bounds,
+    otherwise split the text proportionally and keep the segment's
+    coarse flag."""
+    out = []
+    for seg in segs:
+        words = seg.get("words") or []
+        if not words:
+            # No word ts: split the text at terminal punctuation,
+            # distributing the (coarse) span proportionally.
+            raw = seg.get("text_raw") or seg["text"]
+            parts, cur = [], ""
+            for c in raw:
+                cur += c
+                if c in _SENT_END:
+                    parts.append(cur)
+                    cur = ""
+            if cur.strip():
+                parts.append(cur)
+            if len(parts) <= 1:
+                out.append(seg)
+                continue
+            st, en = seg["start_ms"], seg["end_ms"]
+            total = max(len(raw), 1)
+            pos = 0
+            for i, ptxt in enumerate(parts):
+                lo = st + int(pos / total * (en - st))
+                pos += len(ptxt)
+                hi = st + int(pos / total * (en - st))
+                if hi <= lo:
+                    hi = lo + 1
+                sub = dict(seg)
+                sub["text"] = _rich_clean(ptxt)
+                sub["text_raw"] = ptxt
+                sub["start_ms"], sub["end_ms"] = lo, hi
+                out.append(sub)
+            continue
+        # Word-level split: group words at sentence-ending punctuation.
+        groups, cur = [], []
+        for w in words:
+            cur.append(w)
+            if any(c in _SENT_END for c in str(w["text"])):
+                groups.append(cur)
+                cur = []
+        if cur:
+            groups.append(cur)
+        if len(groups) <= 1:
+            out.append(seg)
+            continue
+        for g in groups:
+            sub = dict(seg)
+            sub["text"] = _rich_clean("".join(str(w["text"]) for w in g))
+            sub["text_raw"] = sub["text"]
+            sub["start_ms"] = int(g[0]["start_ms"])
+            sub["end_ms"] = int(g[-1]["end_ms"])
+            if sub["end_ms"] <= sub["start_ms"]:
+                sub["end_ms"] = sub["start_ms"] + 1
+            sub["words"] = g
+            sub.pop("coarse", None)  # bounds are word-derived, not estimates
+            out.append(sub)
+    return out
 
 
 def cmd_transcribe(req):

@@ -2,6 +2,8 @@ package dubbing
 
 import (
 	"testing"
+	"fmt"
+	"strings"
 )
 
 func scriptOf(lines ...[3]string) *Script {
@@ -392,5 +394,97 @@ func TestTimelineRoundTrip(t *testing.T) {
 	tl, _ := Reconcile(sc, asr, DefaultReconcileOptions())
 	if err := tl.Validate(); err != nil {
 		t.Fatalf("emitted timeline invalid: %v", err)
+	}
+}
+
+func TestSplitFusedSegments(t *testing.T) {
+	words := func(start, step int, texts ...string) []ASRWord {
+		out := make([]ASRWord, len(texts))
+		for i, x := range texts {
+			out[i] = ASRWord{Text: x, StartMs: start + i*step, EndMs: start + i*step + step}
+		}
+		return out
+	}
+	one := ASRSegment{SegmentID: "s1", StartMs: 0, EndMs: 6000,
+		Text: "你好。世界。", Coarse: true,
+		Words: words(100, 500, "你", "好", "。", "世", "界", "。")}
+	got := SplitFusedSegments([]ASRSegment{one})
+	if len(got) != 2 {
+		t.Fatalf("want 2 splits, got %d", len(got))
+	}
+	if got[0].Text != "你好。" || got[1].Text != "世界。" {
+		t.Fatalf("split text wrong: %q / %q", got[0].Text, got[1].Text)
+	}
+	if got[0].Coarse || got[1].Coarse {
+		t.Fatal("word-derived bounds must not stay coarse")
+	}
+	if got[0].StartMs != 100 || got[0].EndMs != 1600 || got[1].StartMs != 1600 {
+		t.Fatalf("bounds wrong: %+v / %+v", got[0], got[1])
+	}
+	// Text-only (no words) splits proportionally and stays coarse.
+	two := ASRSegment{SegmentID: "s2", StartMs: 0, EndMs: 4000,
+		Text: "第一句。第二句。", Coarse: true}
+	got = SplitFusedSegments([]ASRSegment{two})
+	if len(got) != 2 || !got[0].Coarse {
+		t.Fatalf("text-only split: %d segs coarse=%v", len(got), got[0].Coarse)
+	}
+	// Single sentence untouched.
+	three := ASRSegment{SegmentID: "s3", StartMs: 0, EndMs: 2000, Text: "没有标点"}
+	got = SplitFusedSegments([]ASRSegment{three})
+	if len(got) != 1 || got[0].SegmentID != "s3" {
+		t.Fatalf("single sentence should pass through: %+v", got)
+	}
+}
+
+// Long-recording regression: an 8-minute take where the ASR fused
+// every utterance into ONE segment (no VAD) must still bind all
+// ~60 lines — the per-block line cap must not silently drop lines.
+func TestReconcile_LongRecordingFused(t *testing.T) {
+	const nLines = 60
+	var lines []ScriptLine
+	var full strings.Builder
+	var words []ASRWord
+	pos := 0 // ms
+	for i := 0; i < nLines; i++ {
+		role := "narrator"
+		if i%3 == 1 {
+			role = "character-a"
+		} else if i%3 == 2 {
+			role = "character-b"
+		}
+		text := fmt.Sprintf("这是第%d句对白内容", i)
+		lines = append(lines, ScriptLine{LineID: fmt.Sprintf("l%02d", i+1),
+			SceneID: "s1", RoleID: role, Text: text})
+		// utterance: ~7s speech, ~1s gap; each char a 350ms word
+		runes := []rune(text)
+		for j, r := range runes {
+			words = append(words, ASRWord{Text: string(r),
+				StartMs: pos + j*350, EndMs: pos + j*350 + 330})
+		}
+		end := pos + len(runes)*350
+		words = append(words, ASRWord{Text: "。", StartMs: end, EndMs: end + 100})
+		full.WriteString(text + "。")
+		pos = end + 1100
+	}
+	sc := &Script{Version: 1, Lines: lines}
+	doc := &ASRDoc{Version: 1, Audio: "long.wav", SampleRate: 48000,
+		DurationMs: pos,
+		Segments: []ASRSegment{{SegmentID: "fused-1", StartMs: 0,
+			EndMs: pos, Text: full.String(), Words: words, Coarse: true}}}
+	tl, err := Reconcile(sc, doc, DefaultReconcileOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	bound := map[string]bool{}
+	for _, s := range tl.Segments {
+		if s.LineID != "" && s.Selected {
+			bound[s.LineID] = true
+		}
+	}
+	if len(bound) != nLines {
+		t.Fatalf("bound %d/%d lines; unmatched_lines=%d", len(bound), nLines, len(tl.UnmatchedLines))
+	}
+	if len(tl.UnmatchedLines) != 0 {
+		t.Fatalf("%d recognized lines wrongly unmatched", len(tl.UnmatchedLines))
 	}
 }

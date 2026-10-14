@@ -1,6 +1,7 @@
 package dubbing
 
 import (
+	"strings"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -122,4 +123,93 @@ func (d *ASRDoc) Validate() error {
 		}
 	}
 	return nil
+}
+
+var sentEndRunes = map[rune]bool{'。': true, '！': true, '？': true,
+	'!': true, '?': true, '；': true, ';': true, '…': true}
+
+// SplitFusedSegments cuts segments that fused several sentences (a
+// non-VAD backend can return one segment per whole chunk) at terminal
+// punctuation so the block matcher — capped at a few lines per block —
+// sees sentence-level input. Word-timestamp groups produce measured
+// bounds; text-only splits stay coarse. Segments with no punctuation
+// or only one sentence pass through untouched.
+func SplitFusedSegments(segs []ASRSegment) []ASRSegment {
+	var out []ASRSegment
+	for _, s := range segs {
+		if len(s.Words) > 1 {
+			var groups [][]ASRWord
+			var cur []ASRWord
+			for _, w := range s.Words {
+				cur = append(cur, w)
+				for _, r := range w.Text {
+					if sentEndRunes[r] {
+						groups = append(groups, cur)
+						cur = nil
+						break
+					}
+				}
+			}
+			if len(cur) > 0 {
+				groups = append(groups, cur)
+			}
+			if len(groups) > 1 {
+				for i, g := range groups {
+					sub := s
+					sub.SegmentID = fmt.Sprintf("%s.s%d", s.SegmentID, i+1)
+					sub.Words = g
+					var b strings.Builder
+					for _, w := range g {
+						b.WriteString(w.Text)
+					}
+					sub.Text = b.String()
+					sub.StartMs = g[0].StartMs
+					sub.EndMs = g[len(g)-1].EndMs
+					if sub.EndMs <= sub.StartMs {
+						sub.EndMs = sub.StartMs + 1
+					}
+					sub.Coarse = false // bounds are word-derived
+					out = append(out, sub)
+				}
+				continue
+			}
+		}
+		// Text-only fallback: split at punctuation, proportional bounds,
+		// keep the coarse flag (times are estimates).
+		rs := []rune(s.Text)
+		var parts [][]rune
+		var cur []rune
+		for _, r := range rs {
+			cur = append(cur, r)
+			if sentEndRunes[r] {
+				parts = append(parts, cur)
+				cur = nil
+			}
+		}
+		if len(cur) > 0 {
+			parts = append(parts, cur)
+		}
+		if len(parts) <= 1 {
+			out = append(out, s)
+			continue
+		}
+		total := len(rs)
+		pos := 0
+		span := s.EndMs - s.StartMs
+		for i, p := range parts {
+			lo := s.StartMs + pos*span/total
+			pos += len(p)
+			hi := s.StartMs + pos*span/total
+			if hi <= lo {
+				hi = lo + 1
+			}
+			sub := s
+			sub.SegmentID = fmt.Sprintf("%s.s%d", s.SegmentID, i+1)
+			sub.Text = string(p)
+			sub.Words = nil
+			sub.StartMs, sub.EndMs = lo, hi
+			out = append(out, sub)
+		}
+	}
+	return out
 }

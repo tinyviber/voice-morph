@@ -54,6 +54,10 @@ VoiceMorph 的第二个工作区：**录音是事实来源，台本只是参考*
 
 确定性算法，无 LLM 依赖（语义相似度只允许作加分项，不能推翻顺序约束）：
 
+0. **融合段预切**：`SplitFusedSegments` 先按标点/词级时间戳把
+   无 VAD 的整段切成语句级段（词 ts 派生的边界不标估计）——
+   一段几十句的融合输入不会撞上块匹配的行数上限，外部 asr-raw
+   也走同一入口。
 1. **归一化**：去标点空白、全角折半角、小写；保留原文字符索引映射，
    使切回原文取 `spoken_text` 时每个真实字符都能还原。
 2. **块级 DP**：`lines × segs` 网格上的最小代价路径，块 ≤
@@ -80,13 +84,17 @@ VoiceMorph 的第二个工作区：**录音是事实来源，台本只是参考*
 7. **审核协议**：`review_required` + `review_reasons`（
    `low_similarity`/`estimated_boundary`/`ambiguous_takes`/
    `unmatched_audio`/`low_asr_confidence`/`needs_role`）。
-   人工编辑写 `edited:true`；`MergeReviewed` 以
-   （line_id, asr_ref, ±2s）为键把审核结果并回新草稿——重跑校对不丢
-   人工工作。两份文件 `audio_sha256` 不符时直接拒绝合并（旧审核不许
-   嫁接新录音）。未匹配音频人工指定角色后置为
-   `match_status:"manual"`（人工绑定），与正常行一样参与渲染。
-   **渲染默认拦截未审核段**进 `skipped`；`--allow-unreviewed` 显式
-   放行并逐段记 `manifest.warnings`。
+   人工编辑写 `edited:true`（只标记被碰过）；显式确认写
+   `reviewed:true` 才解除审核门——改文本/角色/勾选不等于审核。
+   `MergeReviewed` 以（line_id, asr_ref, ±2s）为键把编辑和确认并回
+   新草稿——重跑校对不丢人工工作。两份文件 `audio_sha256` 不符时
+   直接拒绝合并（旧审核不许嫁接新录音）。未匹配音频人工指定角色
+   后置为 `match_status:"manual"`（人工绑定=审核决定），与正常行
+   一样参与渲染。**渲染默认拦截未审核段**进 `skipped`；
+   `--allow-unreviewed` 显式放行并逐段记 `manifest.warnings`。
+   `manifest.status`：`complete`/`blocked_review`/`partial`/`failed`——
+   有选中行仅因待审核被跳过时报 `blocked_review`，绝不报
+   无条件成功。
 
 ## C. 渲染（render）
 

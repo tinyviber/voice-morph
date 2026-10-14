@@ -59,12 +59,21 @@ GUI 与 CLI 共享同一份配置。
 继续（manifest `status:"failed"` + `failures[]`），否则遇错即停且不写
 manifest。
 
-**审核门**：`review_required:true` 且未经人工编辑（`edited:false`）的
-段默认进 `skipped`（原因 `unreviewed anomaly`）；`--allow-unreviewed`
-显式放行但逐段记 `warnings`。缓存真实生效：同 seg/切点/音频/参数的
-行 WAV 已存在且解码长度正确时直接复用（`cache_hit:true`），参数或
-切点变化自动失配。文件名安全：`role_id`/`segment_id` 只取 [A-Za-z0-9\-_.]，
-其他字符折叠为 `_`——恶意 id 不可能把产物写出输出目录。
+**审核门**：`review_required:true` 且未显式确认（`reviewed:false`）的
+选中段默认进 `skipped`（原因 `unreviewed anomaly`）；`--allow-unreviewed`
+显式放行但逐段记 `warnings`。只改文本/角色/勾选置 `edited` 不放行——
+审核必须走显式确认。
+
+**manifest.status**（下游可机读）：`complete`=所有选中行都已渲染；
+`blocked_review`=有选中行仅因待审核被跳过（只差人审）；`partial`=
+其他选中行缺失；`failed`=有渲染失败。CLI `ok` 与退出码跟着 status 走
+（complete→true/0，其余→false/1）。
+
+缓存真实生效：同 seg/切点/音频/参数的行 WAV 已存在且解码长度正确时
+直接复用（`cache_hit:true`），参数或切点变化自动失配；缓存键用实际
+读到的音频 SHA256，缺声明的时间线也偷不了缓存。文件名安全：
+`role_id`/`segment_id` 只取 [A-Za-z0-9\-_.]，折叠过的 id 追加原 id
+hash8——中文角色名不会互撞，恶意 id 也不可能把产物写出输出目录。
 
 ## manifest.json 结构
 
@@ -72,7 +81,7 @@ manifest。
 {
   "version": 1,
   "audio": "take.wav", "audio_sha256": "…", "sample_rate": 48000,
-  "duration_ms": 12000, "status": "ok",
+  "duration_ms": 12000, "status": "complete|blocked_review|partial|failed",
   "lines": [{"segment_id":"seg-0001","line_id":"l01","role_id":"narrator",
              "wav":"lines/seg-0001-xxxxxxxx.wav",
              "src_wav":"lines/src-seg-0001.wav",   // --src 时
@@ -104,13 +113,14 @@ manifest。
     "start_ms": 500, "end_ms": 2500,
     "match_status": "exact|modified|repeated|unmatched|manual",
     "similarity": 1.0,
-    "review_required": false,
+    "review_required": false, "reviewed": false,
     "review_reasons": ["low_similarity","estimated_boundary",
       "ambiguous_takes","unmatched_audio","low_asr_confidence","needs_role"],
     "take_index": 2, "selected": true,       // 重读的候选 take
     "part_index": 1,                          // 一行被停顿拆成多段时的段序
     "boundary": "measured|word|estimated",   // 边界可信度
-    "edited": false                          // 人工碰过 → 重跑校对时被保留
+    "edited": false,                         // 人工碰过 → 重跑校对时被保留
+    "reviewed": false                        // 显式确认 → 才解除审核门
   }],
   "warnings": [],                            // 校对级全局警告
   "unmatched_lines": [{"line_id":"l04","role_id":"narrator",
@@ -121,8 +131,9 @@ manifest。
 
 **审核写法**：外部 agent 或人直接编辑 `timeline-reviewed.json`
 （复制 timeline.json 改名即可）：改 `role_id`/`spoken_text`/
-`start_ms`/`end_ms`/`selected`，把对应段 `edited:true`。
-unmatched 段想收编：填 `role_id` + `selected:true` + `edited:true`。
+`start_ms`/`end_ms`/`selected` 时把对应段 `edited:true`；确认某段
+无问题把 `reviewed:true`（只有它才解除审核门）。unmatched 段想
+收编：填 `role_id` + `selected:true` + `edited:true`（→ manual）。
 
 ## 典型 agent 流程
 
