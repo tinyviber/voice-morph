@@ -40,6 +40,12 @@ type RenderedClip struct {
 	RenderMS float64     `json:"renderMs"`
 	RTF      float64     `json:"rtf"`
 	TotalMS  float64     `json:"totalMs"`
+	// Trace is the production voicing track the speech pitch stage ran
+	// on — one entry per analysis hop in input-clip positions. The
+	// evaluator's own frames use a longer window and no continuity
+	// hint, so Stats.VoicedRatio does not describe which samples were
+	// synthesized as voiced; Trace does (nil on the legacy path).
+	Trace []engine.SpeechFrame `json:"trace,omitempty"`
 }
 
 // InputReport aggregates everything a reproducible evaluation emits.
@@ -236,11 +242,12 @@ func renderOne(in []float32, job renderJob, opts Options, tracker PitchTracker) 
 	t0 := time.Now()
 	out := eng.Render(in)
 	renderMS := elapsedMS(t0)
+	trace := eng.SpeechTrace()
 	// totalMs adds the output analysis, so the report separates DSP cost
 	// (renderMs, rtf) from evaluation cost.
 	stats := measure(out, tracker, opts.FrameSize, opts.Hop, opts.MinConfidence)
 	clip := RenderedClip{Name: job.name, PresetID: job.presetID, Params: job.params, Stats: stats,
-		RenderMS: renderMS, TotalMS: elapsedMS(t0)}
+		RenderMS: renderMS, TotalMS: elapsedMS(t0), Trace: trace}
 	if stats.DurationSec > 0 {
 		clip.RTF = (renderMS / 1000) / stats.DurationSec
 	}

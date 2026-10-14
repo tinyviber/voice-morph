@@ -7,7 +7,11 @@ type Preset struct {
 	Name   string `json:"name"`
 	NameZh string `json:"nameZh"`
 	Hint   string `json:"hint"` // one-line description shown in the UI
-	Params Params `json:"params"`
+	// Experimental marks a voice not yet validated by listening tests:
+	// it stays renderable (voice-eval baselines, direct params) but the
+	// UI badges it instead of presenting it as a finished product.
+	Experimental bool   `json:"experimental,omitempty"`
+	Params       Params `json:"params"`
 }
 
 // Presets: (pitch, timbre) pairs mirror the documented MorphVOX examples —
@@ -32,8 +36,8 @@ var Presets = []Preset{
 		Params: Params{Pitch: 1, Timbre: 0.55, Strength: 1, Gain: 1, PitchRange: 1}},
 	// Speech-path voices: an absolute F0 center instead of a pitch ratio,
 	// so any input speaker lands near the same target register.
-	{ID: "natural-woman", Name: "Natural Woman", NameZh: "自然女声", Hint: "柔和 · 适合说话",
+	{ID: "natural-woman", Name: "Natural Woman", NameZh: "自然女声", Hint: "实验 · 柔和", Experimental: true,
 		Params: Params{Speech: true, PitchRange: 1.1, TargetF0: 220, Timbre: 0.20, FormantShape: 0.35, Strength: 1, Gain: 1}},
-	{ID: "natural-child", Name: "Natural Child", NameZh: "自然童声", Hint: "明亮 · 适合说话",
+	{ID: "natural-child", Name: "Natural Child", NameZh: "自然童声", Hint: "实验 · 明亮", Experimental: true,
 		Params: Params{Speech: true, PitchRange: 1.15, TargetF0: 280, Timbre: 0.35, FormantShape: 0.45, Strength: 1, Gain: 1}},
 }

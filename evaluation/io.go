@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"html"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -140,6 +141,13 @@ func writeBlindHTML(path string, rep InputReport) error {
 		if err != nil {
 			return fmt.Errorf("read blind WAV %s: %w", r.File, err)
 		}
+		// The copies get a uniform loudness: without it a louder render
+		// wins preference votes regardless of quality. Only the blind
+		// copies are scaled — the renders themselves and their measured
+		// RMS figures in the report stay untouched.
+		if b, err = blindLoudness(b); err != nil {
+			return fmt.Errorf("loudness-match blind WAV %s: %w", r.File, err)
+		}
 		if err := os.WriteFile(dst, b, 0o644); err != nil {
 			return fmt.Errorf("write blind WAV %s: %w", dst, err)
 		}
@@ -153,7 +161,8 @@ main{max-width:980px;margin:auto}.card{background:white;border:1px solid #ddd;bo
 audio{width:100%;margin-top:10px}.muted{color:#666;font-size:.92em}code{background:#eee;padding:2px 5px;border-radius:4px}
 details{margin-top:8px}table{border-collapse:collapse;margin-top:8px}td,th{border-bottom:1px solid #ddd;padding:4px 8px;text-align:left}
 </style><main><h1>VoiceMorph 离线盲听 A/B</h1>
-<p class="muted">本页由 <code>voice-eval</code> 生成。音频标签只显示盲听 ID，音频副本为随机命名；展开底部映射表后可看到条件。请优先评价自然度、音高目标感和失真。</p>`)
+<p class="muted">本页由 <code>voice-eval</code> 生成。音频标签只显示盲听 ID，音频副本为随机命名；展开底部映射表后可看到条件。请优先评价自然度、音高目标感和失真。</p>
+<p class="muted">播放副本已按有声段 RMS 统一响度到 −23 dBFS（峰值不超过 −1 dBFS），避免仅凭音量差异产生偏好；指标表中的 RMS 仍是原始渲染的实测值。</p>`)
 	for i, r := range rows {
 		fmt.Fprintf(&b, `<section class="card"><h2>%s</h2><div class="muted">样本 %d</div><audio controls preload="none" src="%s"></audio></section>`,
 			html.EscapeString(r.ID), i+1, html.EscapeString(display[r.ID]))
@@ -165,6 +174,64 @@ details{margin-top:8px}table{border-collapse:collapse;margin-top:8px}td,th{borde
 	}
 	b.WriteString(`</table></details></main>`)
 	return os.WriteFile(path, []byte(b.String()), 0o644)
+}
+
+// blindTargetRMS and blindPeakCap define the uniform playback level of
+// the blind-page WAV copies: the active-segment RMS (10 ms frames at
+// −60 dBFS or louder) is scaled to −23 dBFS, then the gain is capped so
+// the peak never exceeds −1 dBFS. A clip with no active frames, or one
+// already at the target, is copied byte-identical.
+const (
+	blindTargetRMS = 0.0708 // ≈ −23 dBFS
+	blindPeakCap   = 0.8913 // ≈ −1 dBFS
+	blindGateRMS   = 1e-3   // ≈ −60 dBFS active-frame gate
+)
+
+// blindLoudness returns b re-encoded at the blind playback level. The
+// input bytes are only ever read; the source render stays untouched.
+func blindLoudness(b []byte) ([]byte, error) {
+	x, sr, err := engine.DecodeWAV(b)
+	if err != nil {
+		return nil, err
+	}
+	frame := max(1, sr/100)
+	var energy float64
+	var active int
+	peak := 0.0
+	for i := 0; i+frame <= len(x); i += frame {
+		var fe float64
+		for _, v := range x[i : i+frame] {
+			a := math.Abs(float64(v))
+			fe += a * a
+			if a > peak {
+				peak = a
+			}
+		}
+		if math.Sqrt(fe/float64(frame)) >= blindGateRMS {
+			energy += fe
+			active += frame
+		}
+	}
+	for _, v := range x[len(x)/frame*frame:] {
+		if a := math.Abs(float64(v)); a > peak {
+			peak = a
+		}
+	}
+	g := 1.0
+	if active > 0 {
+		g = blindTargetRMS / math.Sqrt(energy/float64(active))
+	}
+	if peak > 0 && g > blindPeakCap/peak {
+		g = blindPeakCap / peak
+	}
+	if g == 1 || g <= 0 {
+		return b, nil
+	}
+	out := make([]float32, len(x))
+	for i, v := range x {
+		out[i] = float32(math.Max(-1, math.Min(1, float64(v)*g)))
+	}
+	return engine.EncodeWAV(out, sr), nil
 }
 
 func blindID(seed, path string) string {

@@ -43,8 +43,8 @@ const mockPresets: Preset[] = [
   { id: "high", name: "High", nameZh: "高音", hint: "纯音高上移", params: mockParams({ pitch: 0.8 }) },
   { id: "child", name: "Child", nameZh: "小孩", hint: "高音高共振峰", params: mockParams({ pitch: 0.8, timbre: 0.4 }) },
   { id: "chipmunk", name: "Chipmunk", nameZh: "花栗鼠", hint: "极高玩梗", params: mockParams({ pitch: 1, timbre: 0.55 }) },
-  { id: "natural-woman", name: "Natural Woman", nameZh: "自然女声", hint: "柔和 · 适合说话", params: mockParams({ speech: true, targetF0: 220, timbre: 0.2, formantShape: 0.35, pitchRange: 1.1 }) },
-  { id: "natural-child", name: "Natural Child", nameZh: "自然童声", hint: "明亮 · 适合说话", params: mockParams({ speech: true, targetF0: 280, timbre: 0.35, formantShape: 0.45, pitchRange: 1.15 }) },
+  { id: "natural-woman", name: "Natural Woman", nameZh: "自然女声", hint: "实验 · 柔和", experimental: true, params: mockParams({ speech: true, targetF0: 220, timbre: 0.2, formantShape: 0.35, pitchRange: 1.1 }) },
+  { id: "natural-child", name: "Natural Child", nameZh: "自然童声", hint: "实验 · 明亮", experimental: true, params: mockParams({ speech: true, targetF0: 280, timbre: 0.35, formantShape: 0.45, pitchRange: 1.15 }) },
 ];
 
 function zeros(): number[] {

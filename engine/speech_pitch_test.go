@@ -2,6 +2,7 @@ package engine
 
 import (
 	"math"
+	"slices"
 	"testing"
 )
 
@@ -152,6 +153,145 @@ func TestSpeechPitchRange(t *testing.T) {
 		if f := math.Exp(m); math.Abs(f-220)/220 > 0.05 {
 			t.Fatalf("range %.1f: mean f0 %.1f Hz, want ~220", c.rng, f)
 		}
+	}
+}
+
+// A target under half the source pitch (tgt > 2t) used to leave
+// periodic uncovered gaps in the grain overlap-add — audible flutter of
+// near-silence inside voiced runs. The fix: windows grow to 0.6·tgt
+// (~20% neighbor overlap) with a floored edge whose tails read the
+// mark's own pulse body wrapped and energy-normalized — coverage holds
+// without smearing the waveform back to source periodicity, so the
+// pulse-rate pitch cue still lands on the target.
+func TestSpeechPitchDeepDownCoverage(t *testing.T) {
+	// cases where the measured f0 must land on the target
+	for _, c := range []struct{ src, dst float64 }{
+		{300, 100}, {400, 100}, {200, 80}, {250, 110}, {350, 120},
+	} {
+		p := DefaultParams
+		p.TargetF0 = c.dst
+		out := runSpeechPitch(p, glottal(steady(c.src), 1, SampleRate), 2048)
+		if got := estimateF0(f32(out), SampleRate); math.Abs(got-c.dst)/c.dst > 0.05 {
+			t.Fatalf("%.0f→%.0f Hz: f0 %.1f Hz", c.src, c.dst, got)
+		}
+	}
+	// every case, including the rough non-integer-ratio edges: no
+	// 2.5 ms block may approach silence inside the voiced run. Before
+	// the fix the uncovered spans read ≈0 (min/median ~0.03).
+	for _, c := range []struct{ src, dst float64 }{
+		{300, 100}, {400, 100}, {200, 80}, {250, 110}, {350, 120},
+		{150, 60}, {180, 90}, {120, 80},
+	} {
+		p := DefaultParams
+		p.TargetF0 = c.dst
+		out := runSpeechPitch(p, glottal(steady(c.src), 1, SampleRate), 2048)
+		lo, hi := len(out)/4, 3*len(out)/4
+		const blk = 120
+		var vals []float64
+		for i := lo; i+blk <= hi; i += blk {
+			vals = append(vals, rms(f32(out[i:i+blk])))
+		}
+		slices.Sort(vals)
+		if med := vals[len(vals)/2]; vals[0] < 0.1*med {
+			t.Fatalf("%.0f→%.0f Hz: min 2.5ms block rms %.4f vs median %.4f (coverage gap)",
+				c.src, c.dst, vals[0], med)
+		}
+	}
+	// vibrato (non-stationary) input keeps the same coverage and still
+	// resolves the target pitch
+	vib := func(t float64) float64 { return 300 * math.Exp2(0.4*math.Sin(2*math.Pi*3*t)/12) }
+	p := DefaultParams
+	p.TargetF0 = 100
+	out := runSpeechPitch(p, glottal(vib, 1.2, SampleRate), 2048)
+	if got := estimateF0(f32(out), SampleRate); math.Abs(got-100)/100 > 0.05 {
+		t.Fatalf("vibrato 300→100 Hz: f0 %.1f Hz", got)
+	}
+}
+
+// The soft knee keeps the normal intonation band (±4 st) exactly
+// linear — PitchRange=1 preserves phrasing — and only compresses
+// excursions past it, saturating toward ±8 st instead of clipping.
+func TestLimitDevPreservesNormalRange(t *testing.T) {
+	const st = math.Ln2 / 12
+	for _, dev := range []float64{-4, -2.5, -1, 0, 2.5, 4} {
+		if got := limitDev(dev * st); got != dev*st {
+			t.Fatalf("limitDev(%.1f st) = %.3f st, want linear", dev, got/st)
+		}
+	}
+	prev := limitDev(4 * st)
+	for _, dev := range []float64{5, 7, 12, 40} {
+		got := limitDev(dev * st)
+		if got <= prev || got > 8*st {
+			t.Fatalf("limitDev(%.0f st) = %.2f st: not monotone or over cap", dev, got/st)
+		}
+		prev = got
+	}
+	// extremes still compress, just softly: −7 st lands ~−6.5 st, not ±4
+	if got := limitDev(7 * st); got >= 7*st || got <= 4*st {
+		t.Fatalf("7 st mapped to %.2f st", got/st)
+	}
+	// C¹ at the knee: the slope continues smoothly past 4 st
+	if d := limitDev(4.001*st) - limitDev(4*st); math.Abs(d-0.001*st) > 0.0005*st {
+		t.Fatalf("knee discontinuity: step %.4f st", d/st)
+	}
+}
+
+// A vibrato that just reaches the linear knee stays ~1:1 under
+// PitchRange=1 — a global tanh used to compress its swing to ~0.75.
+func TestSpeechPitchIntonationContour(t *testing.T) {
+	vib := func(t float64) float64 { return 140 * math.Exp2(4.5*math.Sin(2*math.Pi*2*t)/12) }
+	in := glottal(vib, 2, SampleRate)
+	_, srcStd := meanStd(trackLogF0(in))
+	p := DefaultParams
+	p.TargetF0, p.PitchRange = 220, 1
+	_, sd := meanStd(trackLogF0(runSpeechPitch(p, in, 2048)))
+	if r := sd / srcStd; r < 0.9 || r > 1.12 {
+		t.Fatalf("contour std ratio %.2f, want ~1.0 (PitchRange=1 preserves)", r)
+	}
+}
+
+// The production voicing track exposes what the synthesizer decided per
+// hop, so voiced misjudgments and F0 jumps can be located on a timeline.
+func TestSpeechPitchTrace(t *testing.T) {
+	e := New()
+	p := DefaultParams
+	p.Speech, p.TargetF0 = true, 200
+	e.SetParams(p)
+	in := f32(glottal(steady(120), 0.6, SampleRate))
+	e.Render(in)
+	tr := e.SpeechTrace()
+	if len(tr) == 0 {
+		t.Fatal("no production trace after a speech render")
+	}
+	var f0s []float64
+	voiced := 0
+	for i, fr := range tr {
+		if i > 0 && fr.Pos <= tr[i-1].Pos {
+			t.Fatalf("trace position %d not increasing", fr.Pos)
+		}
+		if !fr.Voiced {
+			if fr.F0Out != 0 {
+				t.Fatalf("unvoiced hop carries target f0 %v", fr.F0Out)
+			}
+			continue
+		}
+		voiced++
+		f0s = append(f0s, fr.F0Out)
+	}
+	if voiced == 0 {
+		t.Fatal("trace has no voiced hops")
+	}
+	slices.Sort(f0s)
+	if med := f0s[len(f0s)/2]; math.Abs(med-200)/200 > 0.05 {
+		t.Fatalf("median synthesized f0 %.1f, want ~200", med)
+	}
+	// legacy params produce no trace
+	e2 := New()
+	p.Speech = false
+	e2.SetParams(p)
+	e2.Render(in)
+	if tr := e2.SpeechTrace(); tr != nil {
+		t.Fatalf("legacy render left %d trace entries", len(tr))
 	}
 }
 

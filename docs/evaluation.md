@@ -99,7 +99,13 @@ Top level:
 Each `outputs[]` additionally has `name`, `presetId`, exact `params`,
 `wavPath`, `renderMs`, `totalMs`, and `rtf = renderSeconds /
 durationSec`. `totalMs` adds the output's pitch analysis to the render;
-`rtf` isolates the DSP render.
+`rtf` isolates the DSP render. Speech-path renders also carry `trace`:
+the production voicing track the synthesizer actually ran on — one
+entry per analysis hop in input-clip positions with `voiced`, the
+tracker's `f0In` and the synthesized `f0Out`. The evaluator's own
+frames use a longer window and no continuity hint, so `voicedRatio`
+does not describe which samples were synthesized as voiced; `trace`
+does (absent on the legacy path).
 
 The evaluator explicitly marks weak measurements in `notes[]` when the
 clip has too few analysis frames, too little voiced time, or is under
@@ -113,8 +119,11 @@ tests but should not be read as stable voice-quality scores.
 copied beside it under an opaque `sample-<id>.wav` name, so neither the
 labels nor the audio file names reveal the condition; the mapping is
 hidden behind a `<details>` section so listeners can rate A/B before
-revealing labels. `-blind PATH.csv` writes the same manifest (with the
-real WAV paths) for spreadsheet tracking.
+revealing labels. The copies are loudness-matched — active-segment RMS
+scaled to −23 dBFS with peaks capped at −1 dBFS — so a louder render
+cannot win preference votes on volume alone; the renders themselves and
+their reported RMS are left untouched. `-blind PATH.csv` writes the
+same manifest (with the real WAV paths) for spreadsheet tracking.
 Use `-preset woman,natural-woman` (or comma-separated equivalents) to
 compare the legacy alias against the speech-aware natural target.
 
@@ -138,10 +147,11 @@ the reason no child recording is bundled.
   which widens the reported semitone range and can lower the input
   median. Read `f0MinHz`/`f0P10Hz` at 60 Hz as a tracker bound, not a
   measured pitch.
-- The report holds clip-level statistics only, with no per-frame F0
-  track. Within-utterance effects such as the speech path's causal F0
-  center (a running median) lagging a declining contour (natural presets
-  landing below `targetF0`) show up only as summary offsets.
+- `trace` reports the production voicing decisions per hop, but the
+  statistics above it remain clip-level: within-utterance effects such
+  as the speech path's causal F0 center (a running median) lagging a
+  declining contour (natural presets landing below `targetF0`) show up
+  in the trace's `f0Out`, not in the summary metrics.
 - `semitoneRange` spans `f0MinHz`–`f0MaxHz`, so one transition frame can
   dominate it: on `slt` the `natural-child` render reads ~22 st only
   because a single voiced-onset frame (dry 200 Hz fading into wet

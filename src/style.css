@@ -101,6 +101,16 @@ html, body {
   font-size: 12.5px;
   font-weight: 600;
 }
+.preset .exp {
+  font-style: normal;
+  font-size: 9px;
+  color: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  padding: 0 3px;
+  margin-left: 4px;
+  vertical-align: 1px;
+}
 .preset .p-sub {
   display: block;
   margin-top: 1px;

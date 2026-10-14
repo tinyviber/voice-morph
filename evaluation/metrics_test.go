@@ -122,6 +122,59 @@ func TestRunWritesReportWAVAndBlindOutputs(t *testing.T) {
 			t.Fatalf("blind page links %s by its condition name", o.WavPath)
 		}
 	}
+	// Blind copies are loudness-matched (active-frame RMS ≈ −23 dBFS)
+	// while the original renders stay byte-identical — a level
+	// preference must not leak into listening votes.
+	for _, e := range entries {
+		b, err := os.ReadFile(e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		x, sr, err := engine.DecodeWAV(b)
+		if err != nil {
+			t.Fatal(err)
+		}
+		frame := sr / 100
+		var energy float64
+		var n int
+		for i := 0; i+frame <= len(x); i += frame {
+			var fe float64
+			for _, v := range x[i : i+frame] {
+				fe += float64(v * v)
+			}
+			if math.Sqrt(fe/float64(frame)) >= 1e-3 {
+				energy += fe
+				n += frame
+			}
+		}
+		if n == 0 {
+			continue // silent rows (e.g. bypassed renders) stay untouched
+		}
+		got := math.Sqrt(energy / float64(n))
+		if math.Abs(got-blindTargetRMS)/blindTargetRMS > 0.15 {
+			t.Fatalf("blind copy %s active RMS %.4f, want ~%.4f", e, got, blindTargetRMS)
+		}
+	}
+	// The renders themselves are not rescaled: their measured RMS still
+	// matches the reported stats.
+	for _, o := range rep.Outputs {
+		src, err := os.ReadFile(o.WavPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		x, _, err := engine.DecodeWAV(src)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var e float64
+		for _, v := range x {
+			e += float64(v * v)
+		}
+		rmsDB := 20 * math.Log10(math.Sqrt(e/float64(len(x)))+1e-9)
+		if math.Abs(rmsDB-o.Stats.RMSDBFS) > 1 {
+			t.Fatalf("render %s rms %.1f dBFS vs reported %.1f", o.WavPath, rmsDB, o.Stats.RMSDBFS)
+		}
+	}
 	// The CSV manifest lists the original and every output with real paths.
 	csvPath := filepath.Join(dir, "blind.csv")
 	if err := WriteBlind(csvPath, rep); err != nil {
@@ -138,6 +191,30 @@ func TestRunWritesReportWAVAndBlindOutputs(t *testing.T) {
 	}
 	if rep.Input.DurationSec <= 0 || rep.Outputs[0].RTF <= 0 {
 		t.Fatalf("bad timing report: %#v", rep)
+	}
+	// The speech-path output carries the production voicing track; the
+	// legacy path leaves it empty.
+	var speech, legacy *RenderedClip
+	for i := range rep.Outputs {
+		if rep.Outputs[i].PresetID == "natural-woman" {
+			speech = &rep.Outputs[i]
+		} else {
+			legacy = &rep.Outputs[i]
+		}
+	}
+	if speech == nil || legacy == nil {
+		t.Fatalf("missing outputs: %#v", rep.Outputs)
+	}
+	if len(speech.Trace) == 0 {
+		t.Fatal("speech render has no production voicing trace")
+	}
+	if legacy.Trace != nil {
+		t.Fatalf("legacy render left %d trace entries", len(legacy.Trace))
+	}
+	for i := 1; i < len(speech.Trace); i++ {
+		if speech.Trace[i].Pos <= speech.Trace[i-1].Pos {
+			t.Fatalf("trace positions not increasing at %d", i)
+		}
 	}
 }
 

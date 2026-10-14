@@ -27,10 +27,10 @@ MorphVOX 的重采样 + WSOLA 路径把整段音频一起变速：辅音、呼�
 ```
 
 - **PitchTracker**（`engine/pitch.go`）：YIN 式估计器，搜索 60–600 Hz，缓冲区分配后复用。语音音高路径使用 32 ms 分析帧，浊音段使用前帧音高提示与滞回阈值，减少气声、声带低频振动时的跟踪中断。
-- **TD-PSOLA**（`engine/speech_pitch.go`）：固定 hop 网格上按 `logF0_out = center + pitch·ln2 + pitchRange·(logF0 − mu)` 映射音高，并限制输出偏移；`mu` 是源音高的滑动中位数，`center` 默认跟随它，也可由 `targetF0` 指定。音高阶段对清音保留干声，共振峰阶段仍会对清音做较弱的包络调整。
+- **TD-PSOLA**（`engine/speech_pitch.go`）：固定 hop 网格上按 `logF0_out = center + pitch·ln2 + pitchRange·(logF0 − mu)` 映射音高，`pitchRange` 在 ±4 半音内保持线性、极端偏差软限制在 ±8 半音；`mu` 是源音高的滑动中位数，`center` 默认跟随它，也可由 `targetF0` 指定。强降调（目标 < 一半音高）时 grain 窗宽增至 0.6·目标周期并保留 0.4 窗底（窗尾环绕读取原脉冲主体并按能量归一），保证 overlap-add 无零覆盖空洞，同时保留目标周期脉冲作为低音高提示。音高阶段对清音保留干声，共振峰阶段仍会对清音做较弱的包络调整。
 - **谱包络非均匀扭曲**（`engine/formant_shape.go`）：在 `Timbre` 的全局缩放之上叠加 `FormantShape`（−1 厚实 → +1 明亮），通过分段 log 频率映射对 F1/F2 区域施加不同修正。这是声道形状的近似，尚未通过真实儿童目标语音验证。
 
-参数：`speech` 开关、`pitchRange`（0–1.5，1 保持语调）、`targetF0`（70–500 Hz 目标音高中心，0 = 跟随输入；设置后仍叠加 `pitch`）、`formantShape`（−1..1）。两个新增预设 `natural-woman` / `natural-child` 走语音路径；旧的 `woman`/`child` 仍走原路径。前端顶部的“语音模式”开关控制三个对应滑杆是否可用。预设名称表示目标，不保证转换后的听感自然；本次试听仍发现部分 DSP 样本存在电音和机械音，相关结论见下文实验记录。
+参数：`speech` 开关、`pitchRange`（0–1.5，1 保持语调）、`targetF0`（70–500 Hz 目标音高中心，0 = 跟随输入；设置后仍叠加 `pitch`）、`formantShape`（−1..1）。两个新增预设 `natural-woman` / `natural-child` 走语音路径并标记为 **experimental**（UI 显示"实验"徽标），待跨说话人盲听验证后转正；旧的 `woman`/`child` 仍走原路径。前端顶部的“语音模式”开关控制三个对应滑杆是否可用。预设名称表示目标，不保证转换后的听感自然；本次试听仍发现部分 DSP 样本存在电音和机械音，相关结论见下文实验记录。
 
 ## 离线评测 `voice-eval`
 

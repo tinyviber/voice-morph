@@ -37,6 +37,7 @@ export interface Preset {
   name: string;
   nameZh: string;
   hint: string;
+  experimental?: boolean;
   params: Params;
 }
 

@@ -51,7 +51,7 @@ function renderPresets() {
     b.dataset.id = p.id;
     b.innerHTML = `
       <span class="glyph">${PRESET_GLYPH[p.id] ?? "●"}</span>
-      <span class="p-name">${p.nameZh} <small>${p.name}</small></span>
+      <span class="p-name">${p.nameZh} <small>${p.name}</small>${p.experimental ? `<em class="exp">实验</em>` : ""}</span>
       <span class="p-sub">${p.hint}</span>
       <span class="p-vals">${p.params.speech ? `F0 ${p.params.targetF0 || "自动"}` : `P${fmt(p.params.pitch)}`} T${fmt(p.params.timbre)}</span>`;
     b.onclick = async () => {

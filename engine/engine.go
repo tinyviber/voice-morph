@@ -156,6 +156,8 @@ type Engine struct {
 	pitchR, timbreW, strength float64
 	inPos, outPos             int // streamed input / emitted output
 	sr                        float64
+
+	lastTrace []SpeechFrame // speech-path voicing track of the last render
 }
 
 func New() *Engine {
@@ -723,12 +725,13 @@ func (e *Engine) Render(in []float32) []float32 {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	out := make([]float32, len(in))
+	pad := 0
 	if !e.params.Bypass {
 		prior := 0
 		if e.cur.chain != nil {
 			prior = e.cur.chain.Offset()
 		}
-		pad := renderPad(prior)
+		pad = renderPad(prior)
 		x := make([]float64, len(in)+pad)
 		for i, v := range in {
 			x[i+pad] = float64(v)
@@ -763,8 +766,38 @@ func (e *Engine) Render(in []float32) []float32 {
 	} else {
 		copy(out, in)
 	}
+	// harvest the production voicing track before the chain is rebuilt;
+	// positions are shifted from the padded stream into input coordinates
+	e.lastTrace = nil
+	if e.cur != nil {
+		if sc, ok := e.cur.chain.(*SpeechChain); ok && sc.p != nil {
+			e.lastTrace = sc.p.Trace()
+			for i := range e.lastTrace {
+				e.lastTrace[i].Pos -= pad
+			}
+		}
+	}
 	e.rebuildLocked() // reset streaming state for the next render
 	return out
+}
+
+// SpeechTrace returns the voicing track the speech pitch stage decided
+// during the most recent Render — one entry per analysis hop with the
+// tracker's call, its F0 and the synthesized target. During live
+// monitoring it reports the in-flight chain's track instead; nil on
+// the legacy path or before any frame ran.
+func (e *Engine) SpeechTrace() []SpeechFrame {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.lastTrace != nil {
+		return e.lastTrace
+	}
+	if e.cur != nil {
+		if sc, ok := e.cur.chain.(*SpeechChain); ok && sc.p != nil {
+			return sc.p.Trace()
+		}
+	}
+	return nil
 }
 
 // Latency returns the internal algorithmic latency in seconds.

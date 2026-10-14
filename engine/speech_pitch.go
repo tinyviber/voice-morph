@@ -53,6 +53,8 @@ type SpeechPitch struct {
 	t, gt   int
 	tgt     float64
 	g       float64
+	gf      float64 // grain-window floor in the deep-down gap regime
+	gtMax   int     // widest grain half-width used so far (bounds done/drop)
 
 	hist []float64 // recent voiced log-F0, oldest first
 	srt  []float64 // median scratch
@@ -61,7 +63,22 @@ type SpeechPitch struct {
 	ew, ed float64 // decaying wet/dry energy over fully voiced spans
 	gain   float64 // wet level correction at done
 
+	trace []SpeechFrame // per-hop production voicing track
+
 	flushed bool
+}
+
+// SpeechFrame is one hop of the production voicing track: what the
+// tracker decided and which target pitch the synthesizer actually used.
+// The offline evaluator reports it per rendered clip so voiced/unvoiced
+// misjudgments, F0 jumps and artifact positions are locatable — the
+// summary voicedRatio alone cannot distinguish them.
+type SpeechFrame struct {
+	Pos        int     `json:"pos"`        // input position of the analysis center
+	Voiced     bool    `json:"voiced"`     // the decision synthesis ran on
+	F0In       float64 `json:"f0In,omitempty"`
+	F0Out      float64 `json:"f0Out,omitempty"` // synthesized target F0 (voiced only)
+	Confidence float64 `json:"confidence"`
 }
 
 const (
@@ -82,7 +99,26 @@ const (
 	// (~50 ms): fast enough for a syllable, slow enough to average
 	// pulse-position noise.
 	spLevelDecay = 0.8
+	// spDevKnee bounds the intonation band mapped 1:1: PitchRange=1
+	// preserves the speaker's own phrasing inside ±4 st of the center.
+	spDevKnee = 4 * math.Ln2 / 12
+	// spDevCap asymptotically bounds the output swing so extreme falls
+	// and exaggerated ranges compress instead of digging a pitch hole
+	// at the 40 Hz output clamp.
+	spDevCap = 8 * math.Ln2 / 12
 )
+
+// limitDev applies the soft knee to a PitchRange-scaled log-F0
+// deviation: exactly linear inside ±spDevKnee, then a C¹-continuous
+// tanh segment saturating toward ±spDevCap. (The earlier unconditional
+// tanh silently compressed every contour — pitchRange=1 turned ±4 st
+// into ±3.05 st, i.e. a built-in dynamics compressor on intonation.)
+func limitDev(dev float64) float64 {
+	if d := math.Abs(dev); d > spDevKnee {
+		return math.Copysign(spDevKnee+(spDevCap-spDevKnee)*math.Tanh((d-spDevKnee)/(spDevCap-spDevKnee)), dev)
+	}
+	return dev
+}
 
 func NewSpeechPitch(p Params, sr int) *SpeechPitch {
 	if sr <= 0 {
@@ -168,21 +204,24 @@ func (s *SpeechPitch) frame(c int) {
 	}
 	e := s.tr.AnalyzeNear(s.fr, hint)
 	v := 0.0
+	fout := 0.0
 	switch {
 	case e.Voiced:
 		v = 1
-		s.voiced(c, e.F0)
+		fout = s.voiced(c, e.F0)
 	case s.running:
 		// fade the run out across this hop by repeating its last period
 		// at the last target pitch
 		s.synthesize(c + s.t)
 		s.running = false
 	}
+	s.trace = append(s.trace, SpeechFrame{Pos: c, Voiced: e.Voiced, F0In: e.F0, F0Out: fout, Confidence: e.Confidence})
 	s.voice = append(s.voice, v)
-	// the next hop writes no earlier than its fade-in start minus a grain
-	// half-width: (c+hop) − hop − 2·maxT
+	// the next hop writes no earlier than its fade-in start minus a
+	// grain half-width: (c+hop) − hop − t − gt ≥ c − maxT − gmax, where
+	// gmax = max(gtMax, maxT) covers deep target periods beyond 60 Hz
 	prev := s.done
-	s.done = c - 2*s.maxT
+	s.done = c - s.maxT - max(s.gtMax, s.maxT)
 	s.level(prev, s.done)
 	s.drop(c)
 }
@@ -193,8 +232,9 @@ func (s *SpeechPitch) frame(c int) {
 // pins it. A median keeps creaky onsets and octave slips from dragging
 // the center the way a mean would. The center is causal: within a
 // declining sentence it lags above the current F0, so TargetF0 is the
-// long-run voiced median, not a per-utterance one.
-func (s *SpeechPitch) voiced(c int, f0 float64) {
+// long-run voiced median, not a per-utterance one. Returns the
+// target F0 the hop was synthesized at, for the voicing trace.
+func (s *SpeechPitch) voiced(c int, f0 float64) float64 {
 	l := math.Log(f0)
 	// Estimates pinned at the tracker floor are vocal fry or a missed
 	// fundamental; either way they say nothing about the speaker's center.
@@ -215,15 +255,13 @@ func (s *SpeechPitch) voiced(c int, f0 float64) {
 	if s.p.TargetF0 > 0 {
 		center = math.Log(s.p.TargetF0)
 	}
-	// Cap the OUTPUT deviation rather than the input's: PitchRange>1 keeps
-	// intonation lively inside roughly a musical third around the center,
-	// but a sentence-final fall can reach −7 st under mu; amplified and
-	// pinned under a 280 Hz target that lands ~203 Hz — a pitch hole next
-	// to the surrounding 270 that reads as a crack. tanh saturates the
-	// output swing at ±4 st while staying near-linear inside it.
-	dev := s.p.PitchRange * (l - s.mu)
-	const span = 4 * math.Ln2 / 12
-	dev = span * math.Tanh(dev/span)
+	// Cap the OUTPUT deviation rather than the input's: PitchRange>1
+	// keeps intonation lively inside roughly a musical third around the
+	// center, but a sentence-final fall can reach −7 st under mu; amplified
+	// and pinned under a 280 Hz target that lands ~203 Hz — a pitch hole
+	// next to the surrounding 270 that reads as a crack. limitDev keeps
+	// the ±4 st band linear and only compresses excursions past it.
+	dev := limitDev(s.p.PitchRange * (l - s.mu))
 	out := clamp(math.Exp(center+s.p.Pitch*math.Ln2+dev), 40, 900)
 	t := max(s.minT, min(s.maxT, int(math.Round(float64(s.sr)/f0))))
 	if !s.running {
@@ -235,14 +273,36 @@ func (s *SpeechPitch) voiced(c int, f0 float64) {
 		s.running = true
 	}
 	s.t, s.tgt = t, float64(s.sr)/out
-	// Raising pitch shortens grains to two target periods: longer grains
-	// would overlap several source periods at different phases, which
-	// sounds rough. Lowering keeps two source periods.
+	// Coverage: grain centers land tgt apart, so a 2t window leaves
+	// periodic holes whenever tgt > 2t (the mute flutter the review
+	// flagged). The half-width grows to 0.6·tgt instead — a ~20%
+	// neighbor overlap plus the floored edge below — without stretching
+	// to the full two target periods, which would smear the waveform
+	// back toward the source's own periodicity and lose the shift
+	// entirely (a 300→100 Hz move would measure ~300 Hz again).
 	s.gt = min(t, int(math.Round(s.tgt)))
+	if g2 := int(math.Ceil(s.tgt * 0.6)); g2 > s.gt {
+		s.gt = g2
+	}
+	if s.gt > s.gtMax {
+		s.gtMax = s.gt
+	}
+	// In the gap regime the seams between grains sit on floored edges:
+	// the floor holds at 0.4 of real voiced content (see the tail read
+	// in grain), leaving ~7 dB of pulse modulation as the low-pitch cue
+	// while nothing approaches silence. Below the regime the floor is
+	// exactly 0 so the COLA overlap for raising and mild lowering is
+	// untouched.
+	if r := s.tgt / float64(t); r >= 1.8 {
+		s.gf = 0.4
+	} else {
+		s.gf = 0
+	}
 	// prior for packing more grains per second; level() corrects the rest
 	s.g = math.Min(1, math.Sqrt(s.tgt/float64(t)))
 	s.extendMarks(c, t)
 	s.synthesize(c + s.hop/2)
+	return out
 }
 
 // extendMarks places one source mark per period up to the hop's end. The
@@ -350,10 +410,53 @@ func (s *SpeechPitch) grain(to, mark int) {
 		s.wet = append(s.wet, make([]float64, n-len(s.wet))...)
 	}
 	w := s.wet[l-s.wetB:]
-	for j := range 2 * t {
-		h := 0.5 - 0.5*math.Cos(math.Pi*float64(j)/float64(t))
-		w[j] += s.g * h * s.at(mark-t+j)
+	// In the gap regime the window tails tile the inter-pulse span; a
+	// linear read there lands on the source's own troughs whenever
+	// tgt/2 is not a multiple of t, recreating the dips one level up.
+	// The tails instead read the mark's own ±t/2 neighborhood wrapped
+	// — the pulse body itself — and are normalized to a fraction of
+	// the grain's body energy, so the floor holds real voiced energy
+	// instead of chasing the source's silence.
+	k := 1.0
+	if s.gf > 0 {
+		var eb, et float64
+		for j := range 2 * t {
+			r := mark - t + j
+			if d := j - t; d >= -s.t/2 && d < s.t/2 {
+				v := s.at(r)
+				eb += v * v
+			} else {
+				v := s.at(mark + wrap(r-mark+s.t/2, s.t) - s.t/2)
+				et += v * v
+			}
+		}
+		if et > 0 && eb > 0 {
+			k = math.Min(3, math.Sqrt(eb/et))
+		}
 	}
+	for j := range 2 * t {
+		h := s.gf + (1-s.gf)*(0.5-0.5*math.Cos(math.Pi*float64(j)/float64(t)))
+		r := mark - t + j
+		if s.gf > 0 {
+			if d := r - mark; d < -s.t/2 || d >= s.t/2 {
+				// tail: the mark's ±t/2 body, wrapped, rescaled to
+				// the grain's own body energy
+				r = mark + wrap(d+s.t/2, s.t) - s.t/2
+				w[j] += s.g * h * k * s.at(r)
+				continue
+			}
+		}
+		w[j] += s.g * h * s.at(r)
+	}
+}
+
+// wrap returns v reduced into [0, m): positive mod for m>0.
+func wrap(v, m int) int {
+	q := v % m
+	if q < 0 {
+		q += m
+	}
+	return q
 }
 
 // level matches wet power to the dry input's over fully voiced spans.
@@ -425,14 +528,25 @@ func (s *SpeechPitch) voiceAt(h int) float64 {
 	return 0
 }
 
-// drop releases state no future read can reach. After frame c every later
-// grain centers at ≥ c−maxT and reads a mark within ~2 periods of its
-// center, so input below c−3·maxT−hop is dead, as is a mark whose
-// successor already lies below that bound plus maxT. Wet and voicing are
-// read only from emit on. Capping by emit keeps the bound valid however
-// the input was chunked.
+// Trace returns the production voicing track: one entry per analysis
+// hop in stream positions.
+func (s *SpeechPitch) Trace() []SpeechFrame {
+	return append([]SpeechFrame(nil), s.trace...)
+}
+
+// drop releases state no future read can reach. After frame c every
+// later grain centers at ≥ c−maxT and reads a mark within ~2 periods
+// of its center plus a grain half-width, so input below c−3·gmax−hop
+// is dead, as is a mark whose successor already lies below that bound
+// plus gmax. Wet and voicing are read only from emit on. Capping by
+// emit keeps the bound valid however the input was chunked.
 func (s *SpeechPitch) drop(c int) {
-	keep := min(s.emit, c-3*s.maxT-s.hop)
+	// gmax is the period bound the accounting below shares: marks stay
+	// within ~2 periods of a grain center and grains are gmax wide, so
+	// nothing below the bounds is ever read again. Widening it only
+	// retains more state, which is safe at any parameter set.
+	gmax := max(s.gtMax, s.maxT)
+	keep := min(s.emit, c-3*gmax-s.hop)
 	if d := min(keep-s.base, len(s.in)); d > 0 {
 		copy(s.in, s.in[d:])
 		s.in = s.in[:len(s.in)-d]
@@ -448,7 +562,7 @@ func (s *SpeechPitch) drop(c int) {
 		s.voice = s.voice[:len(s.voice)-d]
 		s.hbase += d
 	}
-	for len(s.mark) > 1 && s.mark[1] <= keep+s.maxT {
+	for len(s.mark) > 1 && s.mark[1] <= keep+gmax {
 		s.mark = s.mark[1:]
 	}
 }
