@@ -624,6 +624,13 @@ func emitBlock(t *Timeline, bl []normLine, bs []normSeg, i0, k0 int,
 
 	// For each line, cut its aligned span into per-source-seg pieces.
 	segHasPiece := make([]bool, len(bs))
+	totalB := 0
+	for si := range bs {
+		if segB0[si]+len(bs[si].norm) > totalB {
+			totalB = segB0[si] + len(bs[si].norm)
+		}
+	}
+	claimed := make([]bool, totalB)
 	for li, l := range bl {
 		sp := spans[li]
 		if sp.bMin < 0 {
@@ -692,6 +699,9 @@ func emitBlock(t *Timeline, bl []normLine, bs []normSeg, i0, k0 int,
 				})
 				emittedAny = true
 				segHasPiece[si] = true
+				for b := p; b < q; b++ {
+					claimed[b] = true
+				}
 			}
 			p = q
 		}
@@ -706,6 +716,73 @@ func emitBlock(t *Timeline, bl []normLine, bs []normSeg, i0, k0 int,
 		if segKept[si] && !segHasPiece[si] {
 			*unmatched = append(*unmatched, k0+si)
 			segEmitted[k0+si] = true
+		}
+	}
+
+	// Leftover coverage: chars of a kept segment no line claimed are
+	// still real audio (a fused ASR segment can end mid-utterance).
+	// Emit each unclaimed run — similar to a bound line it becomes a
+	// retake candidate, else an unmatched fragment — so no audio
+	// silently vanishes from the timeline.
+	for si := range bs {
+		if !segKept[si] {
+			continue
+		}
+		src := bs[si]
+		b0, b1 := segB0[si], segB0[si]+len(src.norm)
+		for p := b0; p < b1; {
+			if claimed[p] {
+				p++
+				continue
+			}
+			runStart := p
+			for p < b1 && !claimed[p] {
+				p++
+			}
+			q := p
+			rawLo := src.src[runStart-segB0[si]]
+			rawHi := src.src[q-1-segB0[si]]
+			spoken := strings.TrimSpace(string(src.rs[rawLo : rawHi+1]))
+			if spoken == "" {
+				continue
+			}
+			loMs, kindLo := msFor(si, runStart)
+			hiMs, kindHi := msFor(si, q)
+			if hiMs <= loMs {
+				hiMs = loMs + 1
+			}
+			kind := "estimated"
+			if kindLo == "measured" && kindHi == "measured" {
+				kind = "measured"
+			} else if kindLo != "estimated" && kindHi != "estimated" {
+				kind = "word"
+			}
+			fn, _ := normRunes(spoken)
+			bestSim, bestLine := 0.0, -1
+			for i, l := range bl {
+				if s := similarity(fn, l.norm); s > bestSim {
+					bestSim, bestLine = s, i
+				}
+			}
+			seg := TimelineSegment{
+				ASRSegmentID: src.seg.SegmentID,
+				ASRRaw:       spoken,
+				SpokenText:   spoken,
+				StartMs:      loMs, EndMs: hiMs,
+				Boundary:     kind,
+				Selected:     false,
+			}
+			if bestLine >= 0 && bestSim >= opts.TakeSimilarity {
+				// looks like another reading of an already-bound line
+				l := bl[bestLine]
+				seg.LineID, seg.RoleID, seg.ScriptText = l.line.LineID, l.line.RoleID, l.line.Text
+				seg.MatchStatus, seg.Similarity = MatchRepeated, round3(bestSim)
+			} else {
+				seg.MatchStatus = MatchUnmatched
+				seg.ReviewRequired = true
+				seg.ReviewReasons = []string{ReviewUnmatchedAudio}
+			}
+			t.Segments = append(t.Segments, seg)
 		}
 	}
 
