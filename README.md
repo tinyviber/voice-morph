@@ -17,12 +17,40 @@ MorphVOX Pro 的核心是 Tweak Panel 上的三个参数 + 两段 EQ：
 
 官方预设的数值印证了这个拆分：`低沉 (-0.5, 0, 100%)` 只降调门；`巨人 (-0.5, -0.3, 100%)` 降调门**且**下移共振峰；`小孩 (+0.8, +0.4, 100%)` 两者同时抬升。**Pitch 改变"调"，Timbre 改变"嗓子的体格"** —— 两者正交，这就是 MorphVOX 声音塑造的全部秘密。
 
+## 语音模式（speech path）
+
+MorphVOX 的重采样 + WSOLA 路径把整段音频一起变速：辅音、呼吸和停顿会被同样升降调，听感偏"乐器"。新增的**语音模式**只对有声段做音高变换：
+
+```
+输入 ──> PitchTracker(YIN) ──> 浊音帧 → 1:1 TD-PSOLA ──> 谱包络
+                                (清音/气声原样透传)      非均匀声道扭曲 ──> 输出
+```
+
+- **PitchTracker**（`engine/pitch.go`）：YIN 式估计器，搜索 60–600 Hz，缓冲区分配后复用。语音音高路径使用 32 ms 分析帧，浊音段使用前帧音高提示与滞回阈值，减少气声、声带低频振动时的跟踪中断。
+- **TD-PSOLA**（`engine/speech_pitch.go`）：固定 hop 网格上按 `logF0_out = center + pitch·ln2 + pitchRange·(logF0 − mu)` 映射音高，`pitchRange` 在 ±4 半音内保持线性、极端偏差软限制在 ±8 半音；`mu` 是源音高的滑动中位数，`center` 默认跟随它，也可由 `targetF0` 指定。强降调（目标 < 一半音高）时 grain 窗宽增至 0.6·目标周期并保留 0.4 窗底（窗尾环绕读取原脉冲主体并按能量归一），保证 overlap-add 无零覆盖空洞，同时保留目标周期脉冲作为低音高提示。音高阶段对清音保留干声，共振峰阶段仍会对清音做较弱的包络调整。
+- **谱包络非均匀扭曲**（`engine/formant_shape.go`）：在 `Timbre` 的全局缩放之上叠加 `FormantShape`（−1 厚实 → +1 明亮），通过分段 log 频率映射对 F1/F2 区域施加不同修正。这是声道形状的近似，尚未通过真实儿童目标语音验证。
+
+参数：`speech` 开关、`pitchRange`（0–1.5，1 保持语调）、`targetF0`（70–500 Hz 目标音高中心，0 = 跟随输入；设置后仍叠加 `pitch`）、`formantShape`（−1..1）。两个新增预设 `natural-woman` / `natural-child` 走语音路径并标记为 **experimental**（UI 显示"实验"徽标），待跨说话人盲听验证后转正；旧的 `woman`/`child` 仍走原路径。前端顶部的“语音模式”开关控制三个对应滑杆是否可用。预设名称表示目标，不保证转换后的听感自然；本次试听仍发现部分 DSP 样本存在电音和机械音，相关结论见下文实验记录。
+
+## 离线评测 `voice-eval`
+
+`cmd/voice-eval` 是纯 Go 的离线评测器：把一段 WAV 跑过任意预设或自定义参数，渲染 WAV、产出 JSON 报告（RMS/峰值/浊音率/各分位 F0）、可选生成盲听页或 CSV，并可与外部参考（如 Praat 目标音）对比。不依赖 Python 或网络。评测指标直接复用生产 `engine.PitchTracker`，所以报告与监听路径看到的是同一套音高估计。
+
+```bash
+go build ./cmd/voice-eval
+./voice-eval -in testdata/cmu-arctic-slt-a0003.wav -preset all -report out/report.json -blind out/index.html
+./voice-eval -list-presets            # 列出预设 ID
+```
+
+`testdata/` 附带两条 CMU Arctic 真实语音（`aew` 男声、`slt` 女声；许可见 `cmu_arctic_COPYING.txt`，来源与署名见 `testdata/README.md`）。评测脚本与指标定义见 `docs/evaluation.md`；仓库外还做过一次 DSP 与 Seed-VC 神经转换的盲听对比，结论见 `docs/neural-vc-evaluation.md`。
+
 ## 实现方式
 
 ```
 mic/WebAudio ──┐
                ├─ pre-EQ ── 重采样(1/r) ── WSOLA(α=1/r) ── 共振峰偏移 ── post-EQ ── 增益/软限幅 ──> 输出
-audio file ────┘        └────── Pitch = resample+WSOLA 复合 ──────┘   └── Timbre = 倒谱谱包络扭曲 ──┘
+audio file ────┤        └────── Pitch = resample+WSOLA 复合 ──────┘   └── Timbre = 倒谱谱包络扭曲 ──┘
+               └─ 语音模式 ── PitchTracker ── TD-PSOLA(浊音) ── 非均匀谱包络扭曲 ──> 同上后级
 ```
 
 - **Pitch**：正向重采样把"声带+声道"一起变速（基频和共振峰同倍率缩放），WSOLA 时域分析-合成恢复时长，净效果即音高平移。
@@ -34,7 +62,13 @@ audio file ────┘        └────── Pitch = resample+WSOLA �
 
 ```
 main.go            Morpher 服务（IPC 绑定）+ 窗口入口
-engine/            DSP 引擎：fft / resample / wsola / formant / eq / wav / presets
+engine/            DSP 引擎：engine / eq / fft / formant / formant_shape /
+                   pitch / presets / resample / speech_chain / speech_pitch /
+                   wav / wsola
+cmd/voice-eval/    离线评测 CLI：渲染 WAV + JSON 报告 + 盲听页
+evaluation/        评测指标与报告生成（与引擎同一 PitchTracker）
+testdata/          两条 CMU Arctic 真实语音（含许可证与来源说明）
+docs/              evaluation.md 与神经变声对比实验记录
 src/               前端（Vite + TS）：main.ts UI 逻辑、bridge.ts IPC/mock、style.css
 public/worklet.js  AudioWorklet：采集 2048 采样块 ↔ 播放回写
 index.html         Claude 风格布局（暖纸底 + 衬线 + 珊瑚橙）
@@ -60,8 +94,9 @@ go run github.com/egoist/mygo/cmd/mygo@latest build -platform darwin/universal
 ```bash
 bun run dev:web                 # vite dev server，浏览器打开即看 UI（mock 引擎）
 bun run typecheck               # tsc
-CGO_ENABLED=0 go test ./engine/ # DSP 单测：正弦音高平移/恒等、共振峰上移、EQ、WAV、流式=整段
-go vet ./engine/
+CGO_ENABLED=0 go test ./...     # 引擎 + 评测单测（音高/PSOLA/共振峰/EQ/WAV/指标）
+CGO_ENABLED=0 ./node_modules/.bin/mygo vet .
+bun test                        # 前端流式队列 / monitor 生命周期测试
 ```
 
 浏览器预览模式下桥接层自动降级为 mock（音频原样返回），方便只调样式。

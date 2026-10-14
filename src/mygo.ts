@@ -8,7 +8,7 @@ import { call } from "mygo-runtime";
 export interface FileResult {
   /** base64 16-bit PCM WAV, 48 kHz mono */
   wav: string;
-  /** output duration */
+  /** input duration */
   seconds: number;
   /** input sample rate */
   inHz: number;
@@ -26,6 +26,10 @@ export interface Params {
   bypass: boolean;
   eqPre: number[];
   eqPost: number[];
+  speech: boolean;
+  pitchRange: number;
+  targetF0: number;
+  formantShape: number;
 }
 
 export interface Preset {
@@ -33,6 +37,7 @@ export interface Preset {
   name: string;
   nameZh: string;
   hint: string;
+  experimental?: boolean;
   params: Params;
 }
 
@@ -67,9 +72,22 @@ export const Morpher = {
   },
   /**
    * ProcessChunk morphs one realtime block: base64 little-endian float32
-   * mono at 48 kHz in, same format out. The (streamID, seq) pair makes a
-   * reordered or timed-out call a deterministic rejection instead of an
-   * out-of-turn stream-state mutation — see Morpher.ProcessChunk.
+   * mono at 48 kHz in, same format out.
+   *
+   * Protocol: every chunk carries its (streamID, seq) and the protocol
+   * decides each call's fate under mu, atomically with the DSP work, so a
+   * reordered or late call can never mutate stream state out of turn:
+   *
+   * 	streamID <  curStream              → stale: rejected, zero mutation
+   * 	streamID == curStream, seq ≤ lastSeq → stale: rejected, zero mutation
+   * 	streamID >  curStream              → new stream adopted: DSP state is
+   * 	                                     rebuilt (the previous stream died
+   * 	                                     ≥ a timeout behind; replaying its
+   * 	                                     alignment would echo stale audio)
+   * 	seq > lastSeq                      → processed, lastSeq = seq; a jump
+   * 	                                     leaves a content hole equivalent
+   * 	                                     to the client's drop-oldest policy
+   * 	                                     and is counted in seqGaps
    */
   processChunk(streamID: number, seq: number, pcm: string): Promise<string> {
     return call("Morpher.ProcessChunk", streamID, seq, pcm);
@@ -79,9 +97,12 @@ export const Morpher = {
     return call("Morpher.ProcessFile", wavB64);
   },
   /**
-   * ResetStream begins a monitor epoch: streaming state is rebuilt and
-   * the resolved value is the stream-ID base this monitor's chunks must
-   * carry (base + resync index). Older streams are rejected from then on.
+   * ResetStream begins a monitor epoch: the engine's streaming state is
+   * rebuilt and the returned base defines the stream IDs the monitor's
+   * chunks carry (base + the sender's resync index; epochs are spaced by
+   * streamSpan). From this point on every chunk on an earlier stream is
+   * stale and rejected — calls still in flight from a previous monitor can
+   * no longer mutate state, before the new stream's first block arrives.
    */
   resetStream(): Promise<number> {
     return call("Morpher.ResetStream");

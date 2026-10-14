@@ -16,6 +16,7 @@ let sendTimer: number | undefined;
 const PRESET_GLYPH: Record<string, string> = {
   normal: "◦", low: "▾", giant: "⬣", demon: "♦",
   woman: "❀", high: "▴", child: "✳", chipmunk: "✦",
+  "natural-woman": "❁", "natural-child": "✧",
 };
 
 function scheduleSend() {
@@ -32,9 +33,9 @@ async function init() {
   $("#engine-rate").textContent = `${state.sampleRate / 1000}kHz`;
   $("#latency").textContent = `引擎延迟 ~${Math.round(state.latencyMs)}ms`;
 
+  bindFaders();
   renderPresets();
   renderEq();
-  bindFaders();
   bindMonitor();
   bindFile();
   reflectParams();
@@ -50,13 +51,14 @@ function renderPresets() {
     b.dataset.id = p.id;
     b.innerHTML = `
       <span class="glyph">${PRESET_GLYPH[p.id] ?? "●"}</span>
-      <span class="p-name">${p.nameZh} <small>${p.name}</small></span>
+      <span class="p-name">${p.nameZh} <small>${p.name}</small>${p.experimental ? `<em class="exp">实验</em>` : ""}</span>
       <span class="p-sub">${p.hint}</span>
-      <span class="p-vals">P${fmt(p.params.pitch)} T${fmt(p.params.timbre)}</span>`;
+      <span class="p-vals">${p.params.speech ? `F0 ${p.params.targetF0 || "自动"}` : `P${fmt(p.params.pitch)}`} T${fmt(p.params.timbre)}</span>`;
     b.onclick = async () => {
       params = await bridge.applyPreset(p.id);
       reflectParams();
       markPreset(p.id);
+      scheduleSend();
     };
     box.appendChild(b);
   }
@@ -75,45 +77,80 @@ function bindFaders() {
   const pitch = $<HTMLInputElement>("#pitch");
   const timbre = $<HTMLInputElement>("#timbre");
   const strength = $<HTMLInputElement>("#strength");
+  const pitchRange = $<HTMLInputElement>("#pitch-range");
+  const targetF0 = $<HTMLInputElement>("#target-f0");
+  const formantShape = $<HTMLInputElement>("#formant-shape");
+  const speech = $<HTMLInputElement>("#speech");
 
-  // morph params rebuild the engine's streaming stages (~128ms hole):
-  // dragging must only update readouts; commit on release ('change')
+  // Dragging updates local values and readouts; commit on release ('change').
   const on = (commit: boolean) => () => {
     params.pitch = +pitch.value;
     params.timbre = +timbre.value;
     params.strength = +strength.value / 100;
+    params.pitchRange = +pitchRange.value;
+    params.targetF0 = normalizeTargetF0(+targetF0.value, params.targetF0);
+    params.formantShape = +formantShape.value;
     reflectReadouts();
     if (commit) scheduleSend();
   };
-  for (const el of [pitch, timbre, strength]) {
+  for (const el of [pitch, timbre, strength, pitchRange, targetF0, formantShape]) {
     el.addEventListener("input", on(false));
     el.addEventListener("change", on(true));
   }
 
+  speech.addEventListener("change", () => {
+    params.speech = speech.checked;
+    reflectSpeechMode();
+    scheduleSend();
+  });
+
   $("#reset").onclick = () => {
     params.pitch = params.timbre = 0;
     params.strength = 1;
+    params.pitchRange = 1;
+    params.targetF0 = params.formantShape = 0;
     reflectParams();
     scheduleSend();
   };
 
   $("#bypass").addEventListener("click", () => {
     params.bypass = !params.bypass;
-    $("#bypass").setAttribute("aria-pressed", String(params.bypass));
-    $("#bypass").textContent = params.bypass ? "正在旁通" : "旁通原声";
+    reflectParams();
     scheduleSend();
   });
+}
+
+function normalizeTargetF0(value: number, previous: number): number {
+  // Skip the gap in either direction, including when using arrow keys.
+  if (value <= 0) return 0;
+  if (value < 70) return value < previous ? 0 : 70;
+  return Math.round(value);
+}
+
+function reflectSpeechMode() {
+  $<HTMLInputElement>("#speech").checked = params.speech;
+  $<HTMLFieldSetElement>("#speech-controls").disabled = !params.speech;
+  $("#speech-note").textContent = params.speech
+    ? "已开启，适合说话。"
+    : "开启后可调语调与音高中心。";
 }
 
 function reflectReadouts() {
   $("#pitch-val").textContent = fmt(params.pitch);
   $("#timbre-val").textContent = fmt(params.timbre);
   $("#strength-val").textContent = `${Math.round(params.strength * 100)}%`;
+  $("#pitch-range-val").textContent = `${params.pitchRange.toFixed(2)}×`;
+  $("#target-f0-val").textContent = params.targetF0 === 0 ? "自动" : `${params.targetF0} Hz`;
+  $("#formant-shape-val").textContent = fmt(params.formantShape);
   $("#pitch-note").textContent = `${fmt(params.pitch * 12)} 半音`;
+  $<HTMLInputElement>("#target-f0").setAttribute("aria-valuetext", params.targetF0 === 0 ? "自动" : `${params.targetF0} Hz`);
   for (const [id, v, lo, hi] of [
     ["#pitch", params.pitch, -1, 1],
     ["#timbre", params.timbre, -1, 1],
     ["#strength", params.strength * 100, 0, 100],
+    ["#pitch-range", params.pitchRange, 0, 1.5],
+    ["#target-f0", params.targetF0, 0, 500],
+    ["#formant-shape", params.formantShape, -1, 1],
   ] as const) {
     const el = $<HTMLInputElement>(id);
     el.style.setProperty("--fill", `${((v - lo) / (hi - lo)) * 100}%`);
@@ -123,6 +160,9 @@ function reflectReadouts() {
 
 function reflectParams() {
   reflectReadouts();
+  reflectSpeechMode();
+  $("#bypass").setAttribute("aria-pressed", String(params.bypass));
+  $("#bypass").textContent = params.bypass ? "正在旁通" : "旁通原声";
   syncEqInputs();
 }
 

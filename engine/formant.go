@@ -16,6 +16,15 @@ type Formant struct {
 	lifter   int // cepstral quefrency cutoff, in samples
 	warp     float64
 	strength float64
+	// shape selects the speech tract warp table: srcBin = k/warp then the
+	// log-frequency map adds a F1-vs-F2 asymmetric residual. 0 = the
+	// original uniform map.
+	shape    float64
+	shapeMap []float64     // cached source-bin map
+	tracker  *PitchTracker // nil keeps legacy envelope estimation
+	sr       int
+	frame    []float64
+	logMag   []float64
 	win      []float64
 	in       []float64
 	base     int // absolute index of in[0]
@@ -35,11 +44,34 @@ func NewFormant(warp, strength float64, sr int) *Formant {
 	f := &Formant{
 		n: n, hop: n / 4, lifter: int(0.002 * float64(sr)), // ~2 ms quefrency
 		warp: warp, strength: strength,
-		win:  hann(n),
-		spec: make([]complex128, n),
-		env:  make([]float64, n/2+1),
-		gain: make([]float64, n/2+1),
-		cbuf: make([]complex128, n),
+		win:    hann(n),
+		spec:   make([]complex128, n),
+		env:    make([]float64, n/2+1),
+		gain:   make([]float64, n/2+1),
+		cbuf:   make([]complex128, n),
+		logMag: make([]float64, n),
+		sr:     sr,
+	}
+	return f
+}
+
+// NewSpeechFormant uses F0-adaptive cepstral smoothing and a monotone,
+// nonuniform source-frequency map. This is a tract approximation, not
+// an explicit vowel classifier. Unvoiced frames receive only a gentle
+// envelope correction and always remain on their original timeline.
+func NewSpeechFormant(warp, shape float64, sr int) *Formant {
+	f := NewFormant(warp, 1, sr)
+	f.shape = shape
+	f.tracker = NewPitchTracker(sr)
+	f.frame = make([]float64, max(f.n, 3072*sr/SampleRate))
+	f.shapeMap = make([]float64, f.n/2+1)
+	logBins := make([]float64, len(f.shapeMap))
+	for k := 1; k < len(logBins); k++ {
+		logBins[k] = math.Log2(float64(k) * float64(sr) / float64(f.n) / warp)
+	}
+	mapped := piecewiseWarp(logBins[1:], speechWarpTable(), shape)
+	for k, lf := range mapped {
+		f.shapeMap[k+1] = math.Exp2(lf) * float64(f.n) / float64(sr)
 	}
 	return f
 }
@@ -106,12 +138,31 @@ func (f *Formant) step() {
 	n, nh := f.n, f.n/2+1
 	// windowed frame into spec
 	for i := 0; i < n; i++ {
-		f.spec[i] = complex(f.at(f.pos+i)*f.win[i], 0)
+		v := f.at(f.pos + i)
+		f.spec[i] = complex(v*f.win[i], 0)
 	}
 	fft(f.spec, false)
+	lifter, amount := f.lifter, 1.0
+	if f.tracker != nil {
+		// Extend into retained history to cover low-pitched voices without
+		// adding lookahead beyond the STFT frame.
+		start := f.pos + n - len(f.frame)
+		for i := range f.frame {
+			f.frame[i] = f.at(start + i)
+		}
+		est := f.tracker.Analyze(f.frame)
+		if est.Voiced {
+			// Keep pitch-period peaks outside the lifter passband. At
+			// high F0 this trades spectral resolution for less pitch
+			// leakage; it does not reconstruct missing harmonics.
+			lifter = min(lifter, int(0.5*float64(f.sr)/est.F0))
+		} else {
+			amount = 0.2
+		}
+	}
 
 	// log-magnitude spectrum (one-sided)
-	logMag := make([]float64, n)
+	logMag := f.logMag
 	for i := 0; i < nh; i++ {
 		logMag[i] = math.Log(math.Max(cmplxAbs(f.spec[i]), 1e-8))
 	}
@@ -125,7 +176,7 @@ func (f *Formant) step() {
 	}
 	fft(f.cbuf, true)
 	for i := 0; i < n; i++ {
-		if i > f.lifter && i < n-f.lifter {
+		if i > lifter && i < n-lifter {
 			f.cbuf[i] = 0
 		}
 	}
@@ -137,6 +188,9 @@ func (f *Formant) step() {
 	// envelope warp + strength blend → per-bin gain (log domain)
 	for k := 0; k < nh; k++ {
 		src := float64(k) / f.warp
+		if f.shapeMap != nil {
+			src = f.shapeMap[k]
+		}
 		if src > float64(nh-1) {
 			// warp<1 pushes src past the top bin: nothing to warp
 			// toward, so leave this bin's envelope unchanged
@@ -154,7 +208,11 @@ func (f *Formant) step() {
 		// mapped onto a peak would otherwise gain thousands-fold and
 		// amplify the noise floor into audible hiss / clipping, while
 		// still leaving room for large timbre warps
-		g := clamp((warpedEnv-f.env[k])*f.strength, -6, 6)
+		limit := 6.0
+		if f.tracker != nil {
+			limit = math.Log(4) // ±12 dB bounds noise-floor amplification
+		}
+		g := clamp((warpedEnv-f.env[k])*f.strength*amount, -limit, limit)
 		f.gain[k] = math.Exp(g)
 	}
 
