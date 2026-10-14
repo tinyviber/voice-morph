@@ -246,18 +246,67 @@ func anchorSplit(s normSeg, lines []normLine, opts ReconcileOptions) ([]normSeg,
 		if seedLen < 3 {
 			continue
 		}
-		idx := indexFrom(s.norm, l.norm[:seedLen], cursor)
-		if idx > cursor {
-			anchors = append(anchors, idx)
-			cursor = idx
+		first := indexFrom(s.norm, l.norm[:seedLen], cursor)
+		if first <= cursor {
+			continue
+		}
+		anchors = append(anchors, first)
+		// Every further occurrence of the SAME seed is a re-read of
+		// this line — give it a cut point so the slip and the retake
+		// become separate pieces and the take machinery can offer
+		// both readings side by side instead of gluing them into
+		// one doubled segment.
+		for prev := first; ; {
+			nxt := indexFrom(s.norm, l.norm[:seedLen], prev+seedLen)
+			if nxt <= prev {
+				break
+			}
+			anchors = append(anchors, nxt)
+			prev = nxt
+		}
+		cursor = first
+	}
+	sort.Ints(anchors)
+	uniq := anchors[:1]
+	for _, a := range anchors[1:] {
+		if a != uniq[len(uniq)-1] {
+			uniq = append(uniq, a)
 		}
 	}
+	anchors = uniq
 	if len(anchors) < 3 {
 		return []normSeg{s}, 0
 	}
 	anchors = append(anchors, len(s.norm))
 	pieces := make([]normSeg, 0, len(anchors)-1)
 	span := s.seg.EndMs - s.seg.StartMs
+	// Map TEXT POSITION → word index → timestamp: cum[j] counts the
+	// normalized runes covered by words[:j], so a cut at norm pos p
+	// lands at the word holding that text position — under variable
+	// speech rate a time-proportional guess would snap to the wrong
+	// word. Proportional time remains the fallback for wordless segs.
+	cum := make([]int, len(s.seg.Words)+1)
+	for j, w := range s.seg.Words {
+		wn, _ := normRunes(w.Text)
+		cum[j+1] = cum[j] + len(wn)
+	}
+	cumTotal := cum[len(s.seg.Words)]
+	cutAt := func(p int) int {
+		if cumTotal == 0 {
+			return s.seg.StartMs + p*span/len(s.norm)
+		}
+		tgt := p * cumTotal / len(s.norm)
+		j := sort.Search(len(s.seg.Words), func(j int) bool {
+			return cum[j+1] > tgt
+		})
+		if j <= 0 {
+			return s.seg.Words[0].StartMs
+		}
+		if j >= len(s.seg.Words) {
+			return s.seg.Words[len(s.seg.Words)-1].EndMs
+		}
+		return (s.seg.Words[j-1].EndMs + s.seg.Words[j].StartMs) / 2
+	}
 	for i := 0; i+1 < len(anchors); i++ {
 		a, b := anchors[i], anchors[i+1]
 		sub := s
@@ -266,14 +315,7 @@ func anchorSplit(s normSeg, lines []normLine, opts ReconcileOptions) ([]normSeg,
 		// normalization can't corrupt the piece text.
 		from, to := s.src[a], s.src[b-1]+1
 		sub.seg.Text = string(s.rs[from:to])
-		lo := s.seg.StartMs + a*span/len(s.norm)
-		hi := s.seg.StartMs + b*span/len(s.norm)
-		if len(s.seg.Words) > 0 {
-			// Snap each cut to the nearest word edge — real timestamp,
-			// inferred position.
-			lo = snapWordEdge(s.seg.Words, lo)
-			hi = snapWordEdge(s.seg.Words, hi)
-		}
+		lo, hi := cutAt(a), cutAt(b)
 		if hi <= lo {
 			hi = lo + 1
 		}
@@ -311,19 +353,6 @@ func indexFrom(hay, needle []rune, from int) int {
 		}
 	}
 	return -1
-}
-
-// snapWordEdge returns the word boundary (start or end) nearest ms.
-func snapWordEdge(words []ASRWord, ms int) int {
-	best, bd := ms, 1<<30
-	for _, w := range words {
-		for _, e := range []int{w.StartMs, w.EndMs} {
-			if d := absInt(e - ms); d < bd {
-				best, bd = e, d
-			}
-		}
-	}
-	return best
 }
 
 func alignBlocks(lines []normLine, segs []normSeg, opts ReconcileOptions) []block {

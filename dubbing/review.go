@@ -22,32 +22,57 @@ func MergeReviewed(draft, reviewed *Timeline) (*Timeline, error) {
 		draft.AudioSHA256 != reviewed.AudioSHA256 {
 		return nil, fmt.Errorf("timeline-reviewed.json 指向不同录音（audio_sha256 不符），拒绝合并旧审核")
 	}
-	type key struct {
-		line, ref string
-		bucket    int
-	}
-	byLine := map[string][]TimelineSegment{}
-	byKey := map[key][]TimelineSegment{}
-	for _, s := range reviewed.Segments {
-		byLine[s.LineID] = append(byLine[s.LineID], s)
-		k := key{s.LineID, s.ASRSegmentID, s.StartMs / 2000}
-		byKey[k] = append(byKey[k], s)
-	}
+	// EVERY merge path resolves segments by STABLE IDENTITY — several
+	// TimelineSegments can share one ASRSegmentID (a fused ASR span
+	// split into lines, or two takes of the same line), so neither
+	// edits nor take selection may key on asr_ref alone. Primary key
+	// is segment_id; the fallback narrows asr_ref candidates by time
+	// (±2s) AND normalized-text anchor, and refuses ambiguity — a lost
+	// verdict stays review-pending, never misapplied.
+	rIdx := newSegIndex(reviewed)
+	dIdx := newSegIndex(draft)
+	boundLines := map[string]bool{}
 	for i, s := range draft.Segments {
-		k := key{s.LineID, s.ASRSegmentID, s.StartMs / 2000}
-		var src *TimelineSegment
-		if cands := byKey[k]; len(cands) > 0 {
-			src = &cands[0]
-		} else {
-			// Fallback: same line, nearest asr_ref in time.
-			for _, c := range byLine[s.LineID] {
-				if c.ASRSegmentID == s.ASRSegmentID || (c.ASRSegmentID == "" && absInt(c.StartMs-s.StartMs) < 2000) {
-					src = &c
-					break
-				}
-			}
+		j, ok := rIdx.resolve(s, s.LineID != "")
+		if !ok {
+			continue
 		}
-		if src == nil || !(src.Edited || src.Reviewed) {
+		src := reviewed.Segments[j]
+		if s.LineID == "" {
+			// Unmatched draft seg: manual bind, or discarded carry.
+			if src.MatchStatus == MatchManual && src.LineID != "" {
+				s.LineID = src.LineID
+				s.ScriptText = src.ScriptText
+				s.RoleID = src.RoleID
+				s.SpokenText = src.SpokenText
+				s.MatchStatus = MatchManual
+				s.Selected = src.Selected || s.Selected
+				s.Edited = true
+				s.Discarded = src.Discarded
+				if src.Reviewed {
+					s.Reviewed = true
+					s.ReviewRequired = false
+					s.ReviewReasons = nil
+				}
+				draft.Segments[i] = s
+				boundLines[s.LineID] = true
+			} else if src.Discarded && src.MatchStatus == MatchUnmatched {
+				draft.Segments[i].Discarded = true
+			} else if src.Edited || src.Reviewed {
+				// Plain edits on unmatched audio (e.g. corrected
+				// spoken text without binding).
+				s.SpokenText = src.SpokenText
+				s.Edited = s.Edited || src.Edited
+				if src.Reviewed {
+					s.Reviewed = true
+					s.ReviewRequired = false
+					s.ReviewReasons = nil
+				}
+				draft.Segments[i] = s
+			}
+			continue
+		}
+		if !(src.Edited || src.Reviewed) {
 			continue
 		}
 		s.RoleID = src.RoleID
@@ -68,75 +93,6 @@ func MergeReviewed(draft, reviewed *Timeline) (*Timeline, error) {
 		}
 		draft.Segments[i] = s
 	}
-	// Manual binds & discards by STABLE SEGMENT IDENTITY — several
-	// TimelineSegments can share one ASRSegmentID (a fused ASR span
-	// split into lines), so a bare asr→index map would graft the last
-	// row's verdict onto siblings. Primary key is segment_id; fallback
-	// resolves asr_ref candidates by time AND text anchor, and refuses
-	// ambiguous matches outright — a lost verdict stays review-pending,
-	// never misapplied.
-	bySegID := map[string]int{}
-	byRef := map[string][]int{}
-	for i := range reviewed.Segments {
-		bySegID[reviewed.Segments[i].SegmentID] = i
-		if reviewed.Segments[i].ASRSegmentID != "" {
-			byRef[reviewed.Segments[i].ASRSegmentID] = append(
-				byRef[reviewed.Segments[i].ASRSegmentID], i)
-		}
-	}
-	resolveReviewed := func(s TimelineSegment) (int, bool) {
-		if j, ok := bySegID[s.SegmentID]; ok {
-			return j, true
-		}
-		var cand []int
-		sn := normText(s.SpokenText)
-		for _, j := range byRef[s.ASRSegmentID] {
-			r := reviewed.Segments[j]
-			if absInt(r.StartMs-s.StartMs) > 2000 {
-				continue
-			}
-			rn := normText(r.SpokenText)
-			if rn == "" || sn == "" || strings.HasPrefix(rn, sn) || strings.HasPrefix(sn, rn) {
-				cand = append(cand, j)
-			}
-		}
-		if len(cand) == 1 {
-			return cand[0], true
-		}
-		return 0, false
-	}
-	boundLines := map[string]bool{}
-	for i, s := range draft.Segments {
-		if s.LineID != "" || s.ASRSegmentID == "" {
-			continue
-		}
-		j, ok := resolveReviewed(s)
-		if !ok {
-			continue
-		}
-		src := reviewed.Segments[j]
-		if src.MatchStatus != MatchManual || src.LineID == "" {
-			if src.Discarded && src.MatchStatus == MatchUnmatched {
-				draft.Segments[i].Discarded = true
-			}
-			continue
-		}
-		s.LineID = src.LineID
-		s.ScriptText = src.ScriptText
-		s.RoleID = src.RoleID
-		s.SpokenText = src.SpokenText
-		s.MatchStatus = MatchManual
-		s.Selected = src.Selected || s.Selected
-		s.Edited = true
-		if src.Reviewed {
-			s.Reviewed = true
-			s.ReviewRequired = false
-			s.ReviewReasons = nil
-		}
-		s.Discarded = src.Discarded
-		draft.Segments[i] = s
-		boundLines[s.LineID] = true
-	}
 	// UnmatchedLines: a bound line is no longer missing; optional
 	// markers from the reviewed file survive the re-run.
 	if len(draft.UnmatchedLines) > 0 {
@@ -155,7 +111,8 @@ func MergeReviewed(draft, reviewed *Timeline) (*Timeline, error) {
 		draft.UnmatchedLines = kept
 	}
 	// Take selection by line: if the reviewed file picked a different
-	// take, honor it.
+	// take, honor it — resolved by stable identity so two takes
+	// sharing an ASR id can't both end up selected.
 	for lid, group := range takeGroups(reviewed) {
 		if len(group) < 2 {
 			continue
@@ -164,11 +121,18 @@ func MergeReviewed(draft, reviewed *Timeline) (*Timeline, error) {
 			if !rs.Selected {
 				continue
 			}
-			for i, ds := range draft.Segments {
-				if ds.LineID == lid && ds.ASRSegmentID == rs.ASRSegmentID {
-					draft.Segments[i].Selected = true
-				} else if ds.LineID == lid && ds.ASRSegmentID != rs.ASRSegmentID && draft.Segments[i].TakeIndex > 0 {
-					draft.Segments[i].Selected = false
+			j, ok := dIdx.resolve(rs, true)
+			if !ok || draft.Segments[j].TakeIndex == 0 {
+				continue // ambiguous or resolved to a non-take — keep
+				// the reconciler's own choice
+			}
+			// A take replaces the line's audio: the picked take wins, every
+			// other segment bound to that line (other takes AND the part
+			// segs) is deselected.
+			for i := range draft.Segments {
+				ds := &draft.Segments[i]
+				if ds.LineID == lid {
+					ds.Selected = i == j
 				}
 			}
 		}
@@ -176,6 +140,79 @@ func MergeReviewed(draft, reviewed *Timeline) (*Timeline, error) {
 	draft.RefreshReviewCount()
 	draft.ReorderSortsByTime()
 	return draft, nil
+}
+
+// segIndex supports stable-identity lookups across two timelines.
+type segIndex struct {
+	segs   []TimelineSegment
+	byID   map[string]int
+	byRef  map[string][]int
+	byLine map[string][]int
+}
+
+func newSegIndex(t *Timeline) *segIndex {
+	x := &segIndex{segs: t.Segments, byID: map[string]int{},
+		byRef: map[string][]int{}, byLine: map[string][]int{}}
+	for i, s := range t.Segments {
+		x.byID[s.SegmentID] = i
+		if s.ASRSegmentID != "" {
+			x.byRef[s.ASRSegmentID] = append(x.byRef[s.ASRSegmentID], i)
+		}
+		if s.LineID != "" {
+			x.byLine[s.LineID] = append(x.byLine[s.LineID], i)
+		}
+	}
+	return x
+}
+
+// resolve finds the unique counterpart of s in the index. Identity:
+// segment_id exact (line must also match when requireLine); else
+// asr_ref candidates — or, for segments with no asr ref, same-line
+// candidates — narrowed by ±2s start drift and a normalized-text
+// prefix anchor. The anchor compares ASRRaw (immutable as-recognized
+// text) before falling back to SpokenText, so a heavy human rewrite
+// can't break identity. Exactly one candidate wins; zero or several
+// means "don't know" and the caller leaves the segment pending.
+func (x *segIndex) resolve(s TimelineSegment, requireLine bool) (int, bool) {
+	if j, ok := x.byID[s.SegmentID]; ok &&
+		(!requireLine || x.segs[j].LineID == s.LineID) {
+		return j, true
+	}
+	anchor := func(s TimelineSegment) string {
+		if s.ASRRaw != "" {
+			return normText(s.ASRRaw)
+		}
+		return normText(s.SpokenText)
+	}
+	var cand []int
+	sn := anchor(s)
+	add := func(j int) {
+		r := x.segs[j]
+		if requireLine && r.LineID != s.LineID {
+			return
+		}
+		if absInt(r.StartMs-s.StartMs) > 2000 {
+			return
+		}
+		rn := anchor(r)
+		if rn == "" || sn == "" || strings.HasPrefix(rn, sn) ||
+			strings.HasPrefix(sn, rn) {
+			cand = append(cand, j)
+		}
+	}
+	if s.ASRSegmentID != "" {
+		for _, j := range x.byRef[s.ASRSegmentID] {
+			add(j)
+		}
+	} else {
+		for _, j := range x.byLine[s.LineID] {
+			add(j)
+		}
+	}
+	if len(cand) == 1 {
+		return cand[0], true
+	}
+	return 0, false
 }
 
 func takeGroups(t *Timeline) map[string][]TimelineSegment {

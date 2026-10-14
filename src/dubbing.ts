@@ -328,6 +328,18 @@ export function initDubbing() {
       // stale or empty outDir was a real footgun.
       outDir = p.replace(/[\\/][^\\/]+$/, "");
       $("#dub-out").textContent = outDir;
+      // Session switch: restore this session's voices.json, else clear
+      // — reusing the previous session's voice config silently was a
+      // real footgun.
+      const v = outDir + "/voices.json";
+      try {
+        await call(Dubber.loadTextFile(v));
+        voicesPath = v;
+        $("#dub-voices").textContent = v;
+      } catch {
+        voicesPath = "";
+        $("#dub-voices").textContent = "未选择（该会话无 voices.json）";
+      }
       renderTable();
     } catch (e) { toast((e as Error).message, true); }
   });

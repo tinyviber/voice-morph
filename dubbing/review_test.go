@@ -129,3 +129,58 @@ func TestMergeReviewed_SharedASRIDNoGraft(t *testing.T) {
 		t.Fatalf("siblings lost their state: %+v", m.Segments)
 	}
 }
+
+// Two takes of the same line share one ASRSegmentID: the reviewer's
+// pick must be resolved by stable identity, never by asr_ref alone —
+// otherwise both takes get Selected and the track doubles the line.
+func TestMergeReviewed_TakeSharedASRID(t *testing.T) {
+	mk := func(selected []bool) []TimelineSegment {
+		return []TimelineSegment{
+			{SegmentID: "p1", ASRSegmentID: "asr-003", LineID: "l015",
+				RoleID: "narrator", SpokenText: "我们重新来一遍的完整台词",
+				ASRRaw: "我们重新来一遍的完整台词", StartMs: 500, EndMs: 3000,
+				MatchStatus: MatchExact, Selected: true, TakeIndex: 0},
+			{SegmentID: "t1", ASRSegmentID: "asr-003", LineID: "l015",
+				RoleID: "narrator", SpokenText: "我们重新来一遍的台瓷",
+				ASRRaw: "我们重新来一遍的台瓷", StartMs: 3200, EndMs: 5000,
+				MatchStatus: MatchRepeated, Selected: selected[0], TakeIndex: 1,
+				ReviewRequired: true, ReviewReasons: []string{ReviewAmbiguousTakes}},
+			{SegmentID: "t2", ASRSegmentID: "asr-003", LineID: "l015",
+				RoleID: "narrator", SpokenText: "我们重新来一遍的完整台词",
+				ASRRaw: "我们重新来一遍的完整台词", StartMs: 5200, EndMs: 7600,
+				MatchStatus: MatchRepeated, Selected: selected[1], TakeIndex: 2,
+				ReviewRequired: true, ReviewReasons: []string{ReviewAmbiguousTakes}},
+		}
+	}
+	// Reconciler picked take1; the reviewer picked take2 instead.
+	draft := &Timeline{Version: SchemaVersion, Audio: "t.wav",
+		AudioSHA256: "sha", Segments: mk([]bool{true, false})}
+	reviewed := &Timeline{Version: SchemaVersion, Audio: "t.wav",
+		AudioSHA256: "sha", Segments: mk([]bool{false, true})}
+	for i := range reviewed.Segments { // simulate re-run id churn
+		reviewed.Segments[i].SegmentID = fmt.Sprintf("rev-%d", i)
+	}
+	m, err := MergeReviewed(draft, reviewed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sel []string
+	for _, s := range m.Segments {
+		if s.LineID == "l015" && s.Selected {
+			sel = append(sel, s.SegmentID)
+		}
+	}
+	if len(sel) != 1 || sel[0] != "t2" {
+		t.Fatalf("want exactly take2 selected for l015, got %v (segs=%+v)", sel, m.Segments)
+	}
+	// Unselected takes stay on the timeline for review, never deleted.
+	var kept int
+	for _, s := range m.Segments {
+		if s.LineID == "l015" && s.TakeIndex > 0 {
+			kept++
+		}
+	}
+	if kept != 2 {
+		t.Fatalf("takes must be retained, kept %d", kept)
+	}
+}

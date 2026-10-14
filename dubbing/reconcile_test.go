@@ -707,15 +707,23 @@ func TestReconcile_FusedMultiRoleRealistic(t *testing.T) {
 	if bound["l100"] == nil || bound["l100"].RoleID != roles[99%3] {
 		t.Fatalf("l100 role wrong: %+v", bound["l100"])
 	}
-	// Retake of l041: expect take candidates (or a second seg bound to l041).
-	takes := 0
+	// Retake of l041 must surface as take candidates: the correct
+	// reading selected, the slip retained unselected for review.
+	var l041Sel, l041All []TimelineSegment
 	for _, s := range tl.Segments {
-		if s.LineID == "l041" && s.TakeIndex > 0 {
-			takes++
+		if s.LineID != "l041" {
+			continue
+		}
+		l041All = append(l041All, s)
+		if s.Selected {
+			l041Sel = append(l041Sel, s)
 		}
 	}
-	if takes == 0 {
-		t.Log("warning: l041 retake not surfaced as take candidates")
+	if len(l041All) < 2 {
+		t.Fatalf("l041 retake not surfaced (segs=%+v)", l041All)
+	}
+	if len(l041Sel) != 1 || !strings.Contains(l041Sel[0].SpokenText, "要说的内容") {
+		t.Fatalf("wrong take selected for l041: %+v", l041Sel)
 	}
 	// Paraphrase l061 must bind but carry a review flag (low_similarity
 	// or ambiguous) — it must not look like a clean exact match.
@@ -723,5 +731,51 @@ func TestReconcile_FusedMultiRoleRealistic(t *testing.T) {
 		t.Fatal("paraphrased l061 unbound")
 	} else if !s.ReviewRequired && s.MatchStatus == MatchExact {
 		t.Fatalf("paraphrase looks too clean: %+v", s)
+	}
+}
+
+// anchorSplit maps TEXT position → word index → timestamp. Under a
+// variable speech rate a time-proportional cut snaps to the wrong
+// word; the char-coverage map must land on the word actually holding
+// that text position.
+func TestAnchorSplit_VariableRate(t *testing.T) {
+	var b strings.Builder
+	var words []ASRWord
+	pos := 0
+	// 20 words × 2 norm chars: first 10 slow (500ms), last 10 fast
+	// (100ms). Text midpoint is char 20, time midpoint would be ~3000 —
+	// which sits inside word 6, NOT at the text boundary.
+	texts := []string{"cc", "cc", "cc", "cc", "cc", "dd", "dd", "dd", "dd", "dd",
+		"ee", "ee", "ee", "ee", "ee", "ff", "ff", "ff", "ff", "ff"}
+	for j, w := range texts {
+		dur := 500
+		if j >= 10 {
+			dur = 100
+		}
+		words = append(words, ASRWord{Text: w, StartMs: pos, EndMs: pos + dur})
+		pos += dur
+		b.WriteString(w)
+	}
+	norm, src := normRunes(b.String())
+	seg := normSeg{seg: ASRSegment{SegmentID: "f", StartMs: 0, EndMs: pos,
+		Text: b.String(), Words: words, Coarse: true},
+		norm: norm, src: src, rs: []rune(b.String())}
+	var lines []normLine
+	for i, lt := range []string{"cccccccccc", "dddddddddd", "eeeeeeeeee", "ffffffffff"} {
+		n, _ := normRunes(lt)
+		lines = append(lines, normLine{line: ScriptLine{
+			LineID: fmt.Sprintf("l%d", i), Text: lt}, norm: n})
+	}
+	pieces, n := anchorSplit(seg, lines, DefaultReconcileOptions())
+	if n == 0 || len(pieces) < 4 {
+		t.Fatalf("anchorSplit produced %d pieces", len(pieces))
+	}
+	// cuts at text pos 10/20/30 → word-mapped 2500/5000/5500.
+	want := []int{2500, 5000, 5500}
+	got := []int{pieces[1].seg.StartMs, pieces[2].seg.StartMs, pieces[3].seg.StartMs}
+	for i := range want {
+		if absInt(got[i]-want[i]) > 50 {
+			t.Fatalf("cut %d: want ~%d (text-mapped), got %d", i, want[i], got[i])
+		}
 	}
 }
