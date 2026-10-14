@@ -91,14 +91,10 @@ def _rich_clean(text):
 def _probe_word_ts(model):
     """Capability probe: does generate() accept output_timestamp and
     return per-word timings? No fabrication — if the field isn't there,
-    we report false and the Go side degrades to segment boundaries."""
-    import inspect
-    try:
-        sig = inspect.signature(model.generate)
-        if "output_timestamp" not in sig.parameters:
-            return False
-    except Exception:
-        return False
+    we report false and the Go side degrades to segment boundaries.
+    NOTE: AutoModel.generate swallows kwargs via **cfg, so an
+    inspect.signature check can never see output_timestamp — probe the
+    actual call instead."""
     # Build a 1s probe WAV (sine + silence); we only inspect fields.
     import wave, struct, math, tempfile
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
@@ -175,15 +171,40 @@ def cmd_load(req):
     })
 
 
-def _norm_words(item):
+def _norm_words(item, offset_ms=0, text_hint=""):
     """Extract [{text,start_ms,end_ms}] from whatever field layout this
-    funasr version produces; empty list when absent. Never fabricate."""
+    funasr version produces; empty list when absent. Never fabricate.
+    Real layouts seen in the wild:
+      - words: [{text,start,end}, ...] or [[text,start,end], ...]
+      - words: ["你","好"] + timestamp: [[s,e], ...] index-paired
+      - timestamp alone: [[s,e], ...] paired to text_hint characters
+    All times are shifted by offset_ms (chunk reassembly)."""
     out = []
-    candidates = []
-    for key in ("words", "timestamp"):
-        if isinstance(item.get(key), list):
-            candidates = item[key]
-            break
+    words = item.get("words")
+    ts = item.get("timestamp")
+    ts_pairs = [p for p in ts or [] if isinstance(p, (list, tuple)) and len(p) >= 2]
+    if isinstance(words, list) and words and isinstance(words[0], str):
+        # words: list of strings aligned with timestamp pairs.
+        if len(words) == len(ts_pairs):
+            for w, (s, e) in zip(words, ts_pairs):
+                out.append({"text": str(w), "start_ms": int(s) + offset_ms,
+                            "end_ms": int(e) + offset_ms})
+            return out
+    elif isinstance(words, list):
+        candidates = words
+    elif ts_pairs:
+        # Bare timestamp pairs: pair with the characters of the reported
+        # text when counts match exactly; otherwise unusable — skip
+        # rather than fabricate.
+        chars = [c for c in (text_hint or item.get("text") or "")
+                 if not c.isspace()]
+        if len(chars) == len(ts_pairs):
+            for c, (s, e) in zip(chars, ts_pairs):
+                out.append({"text": c, "start_ms": int(s) + offset_ms,
+                            "end_ms": int(e) + offset_ms})
+        return out
+    else:
+        candidates = []
     for w in candidates:
         if isinstance(w, dict):
             t = w.get("text") or w.get("word") or w.get("token") or ""
@@ -194,13 +215,14 @@ def _norm_words(item):
         else:
             continue
         try:
-            out.append({"text": str(t), "start_ms": int(s), "end_ms": int(e)})
+            out.append({"text": str(t), "start_ms": int(s) + offset_ms,
+                        "end_ms": int(e) + offset_ms})
         except (TypeError, ValueError):
             continue
     return out
 
 
-def _segments_from_result(res, offset_ms, want_words):
+def _segments_from_result(res, offset_ms, want_words, duration_ms=0):
     """Normalize funasr generate() output across field-name variants.
     sentence_info (VAD path) -> top-level text fallback."""
     segs = []
@@ -223,23 +245,41 @@ def _segments_from_result(res, offset_ms, want_words):
                     "confidence": None,
                 }
                 if want_words:
-                    seg["words"] = _norm_words(s)
+                    seg["words"] = _norm_words(s, offset_ms, str(txt))
                     if not seg["words"]:
                         seg.pop("words")
                 segs.append(seg)
             continue
-        txt = item.get("text") or item.get("value") or item.get("sentence") or ""
+        txt = str(item.get("text") or item.get("value") or item.get("sentence") or "")
+        words = _norm_words(item, offset_ms, txt) if want_words else []
+        # Non-VAD inference may return only {key, text, timestamp} — no
+        # sentence bounds. Derive coarse bounds from token timestamps if
+        # present, else the whole chunk duration; mark "coarse" so the
+        # Go side flags estimated_boundary instead of emitting an
+        # invalid zero-length segment.
+        st = item.get("start")
+        en = item.get("end", item.get("duration"))
+        coarse = False
+        if st is None or en is None:
+            coarse = True
+            if words:
+                st = words[0]["start_ms"] - offset_ms
+                en = words[-1]["end_ms"] - offset_ms
+            else:
+                st, en = 0, int(duration_ms or 0)
+            if en <= st:
+                en = st + 1
         seg = {
-            "text": _rich_clean(str(txt)),
-            "text_raw": str(txt),
-            "start_ms": int(item.get("start", 0)) + offset_ms,
-            "end_ms": int(item.get("end", item.get("duration", 0))) + offset_ms,
+            "text": _rich_clean(txt),
+            "text_raw": txt,
+            "start_ms": int(st) + offset_ms,
+            "end_ms": int(en) + offset_ms,
             "confidence": None,
         }
-        if want_words:
-            seg["words"] = _norm_words(item)
-            if not seg["words"]:
-                seg.pop("words")
+        if coarse:
+            seg["coarse"] = True
+        if words:
+            seg["words"] = words
         segs.append(seg)
     return segs
 
@@ -271,7 +311,8 @@ def cmd_transcribe(req):
     except Exception as e:
         err("transcribe", "ASR_FAIL", "%s\n%s" % (e, traceback.format_exc()[-800:]), True)
         return
-    segs = _segments_from_result(res, offset, want_words)
+    segs = _segments_from_result(res, offset, want_words,
+                                 int(req.get("duration_ms") or 0))
     fields = []
     for item in res or []:
         if isinstance(item, dict):

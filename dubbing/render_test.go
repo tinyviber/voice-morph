@@ -208,3 +208,158 @@ func TestRender_UnmatchedKeepsRaw(t *testing.T) {
 }
 
 func abs64For(x int64) int64 { return abs64f(x) }
+
+func TestRender_UnreviewedGatedByDefault(t *testing.T) {
+	dir := t.TempDir()
+	src := synthSpeech(4000, [][2]int{{500, 1500}, {2500, 3500}})
+	audioPath := filepath.Join(dir, "take.wav")
+	writeWAV(t, audioPath, src)
+	sha, _ := SHA256File(audioPath)
+	mk := func(edited bool) *Timeline {
+		return &Timeline{
+			Version: SchemaVersion, Audio: audioPath, AudioSHA256: sha,
+			SampleRate: engine.SampleRate, DurationMs: 4000,
+			Segments: []TimelineSegment{
+				{SegmentID: "seg-0001", LineID: "l01", RoleID: "narrator", SpokenText: "你好",
+					ASRRaw: "你好", StartMs: 500, EndMs: 1500, MatchStatus: MatchExact, Selected: true},
+				{SegmentID: "seg-0002", LineID: "l02", RoleID: "narrator", SpokenText: "在吗",
+					ASRRaw: "在吗", StartMs: 2500, EndMs: 3500, MatchStatus: MatchModified,
+					Selected: true, ReviewRequired: true, Edited: edited,
+					ReviewReasons: []string{ReviewLowSimilarity}},
+			},
+		}
+	}
+	tlPath := filepath.Join(dir, "timeline.json")
+	if err := SaveJSON(tlPath, mk(false)); err != nil {
+		t.Fatal(err)
+	}
+	voicesPath := filepath.Join(dir, "voices.json")
+	os.WriteFile(voicesPath, []byte(`{"version":1,"voices":{"narrator":{"backend":"dsp","preset":"normal"}}}`), 0o644)
+	m, err := Render(RenderOptions{TimelinePath: tlPath, VoicesPath: voicesPath, OutDir: filepath.Join(dir, "out")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(m.Lines) != 1 {
+		t.Fatalf("unreviewed anomaly rendered: %+v", m.Lines)
+	}
+	found := false
+	for _, s := range m.Skipped {
+		if s.ID == "seg-0002" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("unreviewed seg not in skipped: %+v", m.Skipped)
+	}
+	// Explicit override renders it but records a warning.
+	m, err = Render(RenderOptions{TimelinePath: tlPath, VoicesPath: voicesPath,
+		OutDir: filepath.Join(dir, "out2"), AllowUnreviewed: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(m.Lines) != 2 || len(m.Warnings) == 0 {
+		t.Fatalf("--allow-unreviewed should render+warn: lines=%v warnings=%v", m.Lines, m.Warnings)
+	}
+	// Human confirmation (edited) clears the gate too.
+	if err := SaveJSON(tlPath, mk(true)); err != nil {
+		t.Fatal(err)
+	}
+	m, err = Render(RenderOptions{TimelinePath: tlPath, VoicesPath: voicesPath, OutDir: filepath.Join(dir, "out3")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(m.Lines) != 2 {
+		t.Fatalf("confirmed seg should render: %+v", m.Lines)
+	}
+}
+
+func TestRender_ManualBindAndPathSafety(t *testing.T) {
+	dir := t.TempDir()
+	src := synthSpeech(4000, [][2]int{{500, 1500}, {2500, 3500}})
+	audioPath := filepath.Join(dir, "take.wav")
+	writeWAV(t, audioPath, src)
+	sha, _ := SHA256File(audioPath)
+	tl := &Timeline{
+		Version: SchemaVersion, Audio: audioPath, AudioSHA256: sha,
+		SampleRate: engine.SampleRate, DurationMs: 4000,
+		Segments: []TimelineSegment{
+			{SegmentID: "seg-0001", LineID: "l01", RoleID: "narrator", SpokenText: "你好",
+				ASRRaw: "你好", StartMs: 500, EndMs: 1500, MatchStatus: MatchExact, Selected: true},
+			// Human bound an ad-lib to a crafted role id — must not escape out dir.
+			{SegmentID: "seg-0002", RoleID: "../evil", SpokenText: "广告词",
+				ASRRaw: "广告词", StartMs: 2500, EndMs: 3500,
+				MatchStatus: MatchManual, Selected: true, Edited: true},
+		},
+	}
+	tlPath := filepath.Join(dir, "timeline.json")
+	if err := SaveJSON(tlPath, tl); err != nil {
+		t.Fatal(err)
+	}
+	voicesPath := filepath.Join(dir, "voices.json")
+	os.WriteFile(voicesPath, []byte(`{"version":1,"voices":{"narrator":{"backend":"dsp","preset":"normal"},"../evil":{"backend":"dsp","preset":"normal"}}}`), 0o644)
+	outDir := filepath.Join(dir, "out")
+	m, err := Render(RenderOptions{TimelinePath: tlPath, VoicesPath: voicesPath, OutDir: outDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(m.Lines) != 2 {
+		t.Fatalf("manual-bound seg should render: %+v", m.Lines)
+	}
+	for _, rel := range m.Roles {
+		if filepath.IsAbs(rel) || !filepath.IsLocal(rel) {
+			t.Fatalf("role track path escapes: %q", rel)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, "evil.wav")); err == nil {
+		t.Fatal("path traversal wrote outside out dir")
+	}
+	if !filepath.IsLocal(m.Lines[1].Wav) {
+		t.Fatalf("line wav path escapes: %q", m.Lines[1].Wav)
+	}
+}
+
+func TestRender_CacheHits(t *testing.T) {
+	dir := t.TempDir()
+	src := synthSpeech(3000, [][2]int{{500, 2500}})
+	audioPath := filepath.Join(dir, "take.wav")
+	writeWAV(t, audioPath, src)
+	sha, _ := SHA256File(audioPath)
+	tl := &Timeline{
+		Version: SchemaVersion, Audio: audioPath, AudioSHA256: sha,
+		SampleRate: engine.SampleRate, DurationMs: 3000,
+		Segments: []TimelineSegment{
+			{SegmentID: "seg-0001", LineID: "l01", RoleID: "narrator", SpokenText: "你好",
+				ASRRaw: "你好", StartMs: 500, EndMs: 2500, MatchStatus: MatchExact, Selected: true},
+		},
+	}
+	tlPath := filepath.Join(dir, "timeline.json")
+	if err := SaveJSON(tlPath, tl); err != nil {
+		t.Fatal(err)
+	}
+	voicesPath := filepath.Join(dir, "voices.json")
+	os.WriteFile(voicesPath, []byte(`{"version":1,"voices":{"narrator":{"backend":"dsp","preset":"normal"}}}`), 0o644)
+	outDir := filepath.Join(dir, "out")
+	m1, err := Render(RenderOptions{TimelinePath: tlPath, VoicesPath: voicesPath, OutDir: outDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(m1.Lines) != 1 || m1.Lines[0].CacheHit {
+		t.Fatalf("first render should render cold: %+v", m1.Lines)
+	}
+	m2, err := Render(RenderOptions{TimelinePath: tlPath, VoicesPath: voicesPath, OutDir: outDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(m2.Lines) != 1 || !m2.Lines[0].CacheHit {
+		t.Fatalf("second render should hit cache: %+v", m2.Lines)
+	}
+	// Same audio but a different voice param → different key → cold again.
+	os.WriteFile(voicesPath, []byte(`{"version":1,"voices":{"narrator":{"backend":"dsp","preset":"low"}}}`), 0o644)
+	m3, err := Render(RenderOptions{TimelinePath: tlPath, VoicesPath: voicesPath, OutDir: outDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(m3.Lines) != 1 || m3.Lines[0].CacheHit {
+		t.Fatalf("param change must bust cache: %+v", m3.Lines)
+	}
+}

@@ -241,12 +241,13 @@ type TranscribeResult struct {
 	Backend  json.RawMessage `json:"backend"`
 }
 
-func (w *WorkerClient) Transcribe(audio string, offsetMs int64, language string, wantWords, mergeVAD bool, mergeLenS, batchSizeS int, useITN bool, onProgress func(ProgressEvent)) (*TranscribeResult, error) {
+func (w *WorkerClient) Transcribe(audio string, offsetMs int64, language string, wantWords, mergeVAD bool, mergeLenS, batchSizeS int, useITN bool, durMs int64, onProgress func(ProgressEvent)) (*TranscribeResult, error) {
 	req := map[string]any{
 		"cmd": "transcribe", "audio": audio, "offset_ms": offsetMs,
 		"language": language, "want_words": wantWords,
 		"merge_vad": mergeVAD, "merge_length_s": mergeLenS,
 		"batch_size_s": batchSizeS, "use_itn": useITN,
+		"duration_ms": durMs,
 	}
 	if err := w.send(req); err != nil {
 		return nil, err

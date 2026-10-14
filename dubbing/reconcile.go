@@ -591,11 +591,16 @@ func emitBlock(t *Timeline, bl []normLine, bs []normSeg, i0, k0 int,
 			return s.StartMs, "measured"
 		}
 		rel := p - segB0[si]
+		edgeKind := "measured"
+		if s.Coarse {
+			// bounds came from chunk duration/token ts, not VAD — an estimate
+			edgeKind = "estimated"
+		}
 		if rel <= 0 {
-			return s.StartMs, "measured"
+			return s.StartMs, edgeKind
 		}
 		if rel >= L {
-			return s.EndMs, "measured"
+			return s.EndMs, edgeKind
 		}
 		if wms, ok := wordEdge(si, p); ok {
 			return wms, "word"

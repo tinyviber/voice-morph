@@ -82,7 +82,11 @@ VoiceMorph 的第二个工作区：**录音是事实来源，台本只是参考*
    `unmatched_audio`/`low_asr_confidence`/`needs_role`）。
    人工编辑写 `edited:true`；`MergeReviewed` 以
    （line_id, asr_ref, ±2s）为键把审核结果并回新草稿——重跑校对不丢
-   人工工作。
+   人工工作。两份文件 `audio_sha256` 不符时直接拒绝合并（旧审核不许
+   嫁接新录音）。未匹配音频人工指定角色后置为
+   `match_status:"manual"`（人工绑定），与正常行一样参与渲染。
+   **渲染默认拦截未审核段**进 `skipped`；`--allow-unreviewed` 显式
+   放行并逐段记 `manifest.warnings`。
 
 ## C. 渲染（render）
 

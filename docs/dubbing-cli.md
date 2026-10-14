@@ -41,7 +41,7 @@ GUI 与 CLI 共享同一份配置。
 `<out>/timeline-reviewed.json` 里 `edited:true` 的行（角色/文本/边界/
 选用）按 (line_id, asr_ref, ±2s) 并回新草稿。
 
-### `voice-dub render --timeline P --voices voices.json --out DIR [--audio WAV] [--only id1,id2] [--src] [--keep-going] [-jobs N]`
+### `voice-dub render --timeline P --voices voices.json --out DIR [--audio WAV] [--only id1,id2] [--src] [--allow-unreviewed] [--keep-going] [-jobs N]`
 读审核后的 timeline 批量变声。`--audio` 可覆盖 timeline 里的音频路径
 （仍会校验 sha256，换了录音会拒绝）；`--src` 让每行附带原声切片
 `lines/src-<segid>.wav` 供 A/B 对比。产物：
@@ -58,6 +58,13 @@ GUI 与 CLI 共享同一份配置。
 `--only` 按 segment_id/line_id 白名单重渲局部；`--keep-going` 单段失败
 继续（manifest `status:"failed"` + `failures[]`），否则遇错即停且不写
 manifest。
+
+**审核门**：`review_required:true` 且未经人工编辑（`edited:false`）的
+段默认进 `skipped`（原因 `unreviewed anomaly`）；`--allow-unreviewed`
+显式放行但逐段记 `warnings`。缓存真实生效：同 seg/切点/音频/参数的
+行 WAV 已存在且解码长度正确时直接复用（`cache_hit:true`），参数或
+切点变化自动失配。文件名安全：`role_id`/`segment_id` 只取 [A-Za-z0-9\-_.]，
+其他字符折叠为 `_`——恶意 id 不可能把产物写出输出目录。
 
 ## manifest.json 结构
 
@@ -95,7 +102,7 @@ manifest。
     "asr_raw": "大家好我们开始吧",           // ASR 原文（证据，不删）
     "spoken_text": "大家好我们开始吧",       // 实际朗读（渲染文本=事实）
     "start_ms": 500, "end_ms": 2500,
-    "match_status": "exact|modified|repeated|unmatched",
+    "match_status": "exact|modified|repeated|unmatched|manual",
     "similarity": 1.0,
     "review_required": false,
     "review_reasons": ["low_similarity","estimated_boundary",

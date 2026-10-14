@@ -58,7 +58,7 @@ func TestWorkerProtocol(t *testing.T) {
 		t.Fatal("loaded reply mismatch")
 	}
 	var prog []ProgressEvent
-	r, err := w.Transcribe("/tmp/x.wav", 0, "zh", false, true, 15, 300, true,
+	r, err := w.Transcribe("/tmp/x.wav", 0, "zh", false, true, 15, 300, true, 4000,
 		func(p ProgressEvent) { prog = append(prog, p) })
 	if err != nil {
 		t.Fatal(err)

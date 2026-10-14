@@ -1,15 +1,24 @@
 package dubbing
 
-import "sort"
+import (
+	"fmt"
+	"sort"
+)
 
 // MergeReviewed folds human edits from a reviewed timeline back into a
 // fresh reconcile draft, keyed by (line_id, asr_ref, start within
 // 2s). Re-running ASR or reconcile never forces the reviewer to redo
 // work: role/spoken/bounds/selection carry over; draft review flags
 // are recomputed but reasons already resolved by an edit are dropped.
-func MergeReviewed(draft, reviewed *Timeline) *Timeline {
+// Edits are refused outright when the two files describe different
+// audio — a stale reviewed file must never graft onto another take.
+func MergeReviewed(draft, reviewed *Timeline) (*Timeline, error) {
 	if draft == nil || reviewed == nil {
-		return draft
+		return draft, nil
+	}
+	if draft.AudioSHA256 != "" && reviewed.AudioSHA256 != "" &&
+		draft.AudioSHA256 != reviewed.AudioSHA256 {
+		return nil, fmt.Errorf("timeline-reviewed.json 指向不同录音（audio_sha256 不符），拒绝合并旧审核")
 	}
 	type key struct {
 		line, ref string
@@ -46,6 +55,9 @@ func MergeReviewed(draft, reviewed *Timeline) *Timeline {
 			s.Boundary = "manual"
 		}
 		s.Selected = src.Selected
+		if src.MatchStatus == MatchManual {
+			s.MatchStatus = MatchManual
+		}
 		s.Edited = true
 		s.ReviewRequired = false
 		s.ReviewReasons = nil
@@ -72,7 +84,7 @@ func MergeReviewed(draft, reviewed *Timeline) *Timeline {
 	}
 	draft.RefreshReviewCount()
 	draft.ReorderSortsByTime()
-	return draft
+	return draft, nil
 }
 
 func takeGroups(t *Timeline) map[string][]TimelineSegment {

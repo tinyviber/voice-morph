@@ -156,7 +156,8 @@ func ScanModels(cfg *UserConfig) []ModelCandidate {
 			}
 		}
 	}
-	for _, c := range []string{os.Getenv("HF_HOME"), os.Getenv("HUGGINGFACE_HUB_CACHE"), os.Getenv("XDG_CACHE_HOME") + "/huggingface/hub"} {
+	// HF_HOME is the HF root; the hub cache lives in <HF_HOME>/hub.
+	for _, c := range []string{filepath.Join(os.Getenv("HF_HOME"), "hub"), os.Getenv("HUGGINGFACE_HUB_CACHE"), os.Getenv("XDG_CACHE_HOME") + "/huggingface/hub"} {
 		for _, id := range modelIDsHF {
 			for _, d := range hfSnapshotDirs(c, id) {
 				add(d, "hf")

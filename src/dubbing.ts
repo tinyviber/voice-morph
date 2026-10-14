@@ -51,6 +51,7 @@ let manifest: any = null;
 
 const STATUS_ZH: Record<string, string> = {
   exact: "一致", modified: "改写", repeated: "重读", unmatched: "未匹配",
+  manual: "人工绑定",
 };
 const REASON_ZH: Record<string, string> = {
   low_similarity: "相似度低", estimated_boundary: "边界估计",
@@ -148,7 +149,7 @@ function renderTable() {
       <td><input class="spoken" data-i="${i}" value="${esc(s.spoken_text)}"></td>
       <td><select class="role" data-i="${i}"><option value="">（未分配）</option>${roleOptions(s.role_id ?? "")}</select></td>
       <td>${status} ${take} <span class="sim">${s.similarity.toFixed(2)}</span></td>
-      <td class="reasons">${esc(reasons)}</td>
+      <td class="reasons">${esc(reasons)}${s.review_required ? ` <button class="btn mini ok-seg" data-i="${i}" title="确认此片段已审核无误">确认</button>` : ""}</td>
       <td><input type="checkbox" class="sel" data-i="${i}"${s.selected ? " checked" : ""}></td>
     </tr>`;
   }).join("");
@@ -172,10 +173,26 @@ function renderTable() {
       const s = tl!.segments[+el.dataset.i!]!;
       s.role_id = el.value;
       s.edited = true;
+      // 未匹配音频被人工分配角色 → 人工绑定，可以正常进成片
+      if (s.match_status === "unmatched" && el.value) {
+        s.match_status = "manual";
+        s.selected = true;
+        s.review_required = false;
+        s.review_reasons = [];
+      }
       if (el.value) {
         s.review_reasons = (s.review_reasons ?? []).filter((r) => r !== "needs_role");
         if (!s.review_reasons.length) s.review_required = false;
       }
+      renderTable();
+    }));
+  body.querySelectorAll<HTMLElement>(".ok-seg").forEach((el) =>
+    el.addEventListener("click", () => {
+      const s = tl!.segments[+el.dataset.i!]!;
+      s.review_required = false;
+      s.review_reasons = [];
+      s.edited = true;
+      renderTable();
     }));
   body.querySelectorAll<HTMLInputElement>(".sel").forEach((el) =>
     el.addEventListener("change", () => {
@@ -278,7 +295,12 @@ export function initDubbing() {
     try {
       manifest = await call(Dubber.render(reviewed, voicesPath, outDir + "/rendered"));
       renderManifest();
-      toast(`渲染完成：${manifest.lines?.length ?? 0} 段`);
+      const fails = manifest.failures?.length ?? 0;
+      const skips = manifest.skipped?.length ?? 0;
+      toast(manifest.status === "ok"
+        ? `渲染完成：${manifest.lines?.length ?? 0} 段${skips ? `（${skips} 跳过）` : ""}`
+        : `渲染部分失败：${fails} 段失败，${manifest.lines?.length ?? 0} 段成功`,
+        manifest.status !== "ok");
     } catch (e) {
       toast("渲染失败: " + (e as Error).message, true);
     } finally {
@@ -310,6 +332,7 @@ function renderManifest() {
     <div class="manifest-foot">
       <button id="dub-play-mix" class="btn">▶ 混音轨</button>
       ${(manifest.skipped ?? []).map((s: any) => `<span class="chip warn">跳过 ${esc(s.id)}: ${esc(s.reason)}</span>`).join("")}
+      ${(manifest.failures ?? []).map((f: any) => `<span class="chip bad">失败 ${esc(f.segment_id)}: ${esc(f.error)}</span>`).join("")}
       ${(manifest.warnings ?? []).map((w: string) => `<span class="chip warn">${esc(w)}</span>`).join("")}
     </div>`;
   box.querySelectorAll<HTMLElement>(".mplay").forEach((b) =>

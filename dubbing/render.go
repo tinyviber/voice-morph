@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
 
 	"voice-morph/engine"
@@ -93,6 +95,10 @@ type RenderOptions struct {
 	// WriteSrc writes lines/src-<segid>.wav — the raw source window next
 	// to each rendered line so agents/listeners can A/B without reslicing.
 	WriteSrc bool
+	// AllowUnreviewed renders segments still flagged review_required
+	// (each is recorded in manifest.warnings). Default false: unreviewed
+	// anomalies land in skipped instead of silently shipping.
+	AllowUnreviewed bool
 }
 
 // ctxWarmMs bounds how much leading context we feed the DSP so its
@@ -159,6 +165,15 @@ func Render(opts RenderOptions) (*Manifest, error) {
 			m.Skipped = append(m.Skipped, ManifestSkip{ID: s.SegmentID, Reason: "unmatched or no role"})
 			continue
 		}
+		if s.ReviewRequired && !s.Edited && !opts.AllowUnreviewed {
+			m.Skipped = append(m.Skipped, ManifestSkip{ID: s.SegmentID,
+				Reason: "unreviewed anomaly: " + strings.Join(s.ReviewReasons, ",")})
+			continue
+		}
+		if s.ReviewRequired && !s.Edited {
+			m.Warnings = append(m.Warnings, fmt.Sprintf("%s: rendered unreviewed (%s)",
+				s.SegmentID, strings.Join(s.ReviewReasons, ",")))
+		}
 		p, err := voices.ParamsFor(s.RoleID)
 		if err != nil {
 			if opts.KeepGoing {
@@ -196,8 +211,16 @@ func Render(opts RenderOptions) (*Manifest, error) {
 	}
 
 	// Parallel per-segment render; each segment gets a fresh engine so
-	// no DSP state ever bleeds across roles.
+	// no DSP state ever bleeds across roles. Content-addressed cache:
+	// a lines/<seg>-<key8>.wav that already decodes to the expected
+	// length is reused verbatim — parameters or cuts change the key.
 	results := make([][]float32, len(jobs))
+	cacheHit := make([]bool, len(jobs))
+	wavNames := make([]string, len(jobs))
+	for i, j := range jobs {
+		key := cacheKey(j.seg, cuts[i], tl.AudioSHA256, j.params)
+		wavNames[i] = fmt.Sprintf("lines/%s-%s.wav", safeFileName(j.seg.SegmentID), key[:8])
+	}
 	if opts.Jobs < 1 {
 		opts.Jobs = runtime.NumCPU()
 	}
@@ -218,6 +241,18 @@ func Render(opts RenderOptions) (*Manifest, error) {
 			sem <- struct{}{}
 			defer func() { <-sem }()
 			c := cuts[i]
+			// Cache hit: reuse the decoded product, still verify it.
+			if x, err := LoadWAV48(joinOut(out, wavNames[i])); err == nil && len(x) == c.b-c.a {
+				results[i] = x
+				cacheHit[i] = true
+				mu.Lock()
+				done++
+				if opts.OnProgress != nil {
+					opts.OnProgress(done, len(jobs))
+				}
+				mu.Unlock()
+				return
+			}
 			ctxL := minInt(MsToSamples(ctxWarmMs, len(src)), c.a)
 			ctxR := minInt(MsToSamples(ctxTailMs, len(src)), len(src)-c.b)
 			window := slice(src, c.a-ctxL, c.b+ctxR)
@@ -248,18 +283,19 @@ func Render(opts RenderOptions) (*Manifest, error) {
 		if results[i] == nil {
 			continue
 		}
-		key := cacheKey(j.seg, cuts[i], tl.AudioSHA256, j.params)
-		wavName := fmt.Sprintf("lines/%s-%s.wav", j.seg.SegmentID, key[:8])
-		if err := SaveWAV(joinOut(out, wavName), results[i]); err != nil {
+		wavName := wavNames[i]
+		if !cacheHit[i] {
+			if err := SaveWAV(joinOut(out, wavName), results[i]); err != nil {
 			if opts.KeepGoing {
 				fail(i, err)
 				continue
 			}
 			return nil, err
+			}
 		}
 		srcName := ""
 		if opts.WriteSrc {
-			srcName = fmt.Sprintf("lines/src-%s.wav", j.seg.SegmentID)
+			srcName = fmt.Sprintf("lines/src-%s.wav", safeFileName(j.seg.SegmentID))
 			if err := SaveWAV(joinOut(out, srcName), slice(src, cuts[i].a, cuts[i].b)); err != nil {
 				m.Warnings = append(m.Warnings, srcName+": "+err.Error())
 				srcName = ""
@@ -269,7 +305,7 @@ func Render(opts RenderOptions) (*Manifest, error) {
 		m.Lines = append(m.Lines, ManifestLine{
 			SegmentID: j.seg.SegmentID, LineID: j.seg.LineID, RoleID: j.seg.RoleID,
 			Wav: wavName, SrcWav: srcName, CutStartMs: aMs, CutEndMs: bMs, DurationMs: bMs - aMs,
-			Backend: "dsp", Experimental: j.exp})
+			CacheHit: cacheHit[i], Backend: "dsp", Experimental: j.exp})
 		if _, ok := roleBuf[j.seg.RoleID]; !ok {
 			roleBuf[j.seg.RoleID] = make([]float32, len(src))
 			filled[j.seg.RoleID] = make([]bool, len(src))
@@ -293,7 +329,7 @@ func Render(opts RenderOptions) (*Manifest, error) {
 	}
 	sort.Strings(roleIDs)
 	for _, r := range roleIDs {
-		name := "roles/" + r + ".wav"
+		name := "roles/" + safeFileName(r) + ".wav"
 		if err := SaveWAV(joinOut(out, name), roleBuf[r]); err != nil {
 			return nil, err
 		}
@@ -343,14 +379,46 @@ func Render(opts RenderOptions) (*Manifest, error) {
 
 func cacheKey(seg TimelineSegment, c struct{ a, b int }, audioSHA string, p engine.Params) string {
 	h := sha256.New()
-	fmt.Fprintf(h, "%s|%d|%d|%s|%.6f|%.6f|%.6f|%.4f|%v|%v|%.4f|%s|engine-v1",
+	fmt.Fprintf(h, "%s|%d|%d|%s|%.6f|%.6f|%.6f|%.4f|%v|%v|%.4f|%.4f|%v|%v|engine-v2",
 		seg.SegmentID, c.a, c.b, audioSHA, p.Pitch, p.Timbre, p.Strength, p.Gain,
-		p.Bypass, p.Speech, p.PitchRange, fmt.Sprintf("%.3f", p.FormantShape))
+		p.Bypass, p.Speech, p.PitchRange, p.TargetF0, p.EqPre, p.EqPost)
+	fmt.Fprintf(h, "|%.6f", p.FormantShape)
 	return hex.EncodeToString(h.Sum(nil))
 }
 
+// safeFileName maps an arbitrary id to a filesystem-safe component:
+// alnum plus -_. only, everything else collapses to _. Path traversal
+// through crafted role/segment ids cannot escape the output dir.
+func safeFileName(id string) string {
+	b := strings.Builder{}
+	b.Grow(len(id))
+	for _, r := range id {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9',
+			r == '-', r == '_', r == '.':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('_')
+		}
+	}
+	s := b.String()
+	s = strings.Trim(s, ".")
+	if s == "" {
+		s = "_"
+	}
+	return s
+}
+
+// joinOut joins a path inside the output dir and refuses any rel path
+// that would escape it (belts on top of safeFileName'd components).
 func joinOut(dir, rel string) string {
-	return dir + "/" + rel
+	p := filepath.Clean(filepath.Join(dir, rel))
+	base := filepath.Clean(dir) + string(os.PathSeparator)
+	if p != filepath.Clean(dir) && !strings.HasPrefix(p, base) {
+		// Fall back to a sanitized flat name rather than escaping.
+		p = filepath.Join(dir, safeFileName(rel))
+	}
+	return p
 }
 
 func selectedForRender(tl *Timeline, only map[string]bool) []TimelineSegment {

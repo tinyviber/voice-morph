@@ -93,7 +93,7 @@ func Analyze(opts AnalyzeOptions) (*ASRDoc, *Timeline, error) {
 	needChunk := !lr.VAD && opts.ChunkSec > 0 && durMs > int64(opts.ChunkSec)*1000
 	if !needChunk {
 		r, err := w.Transcribe(opts.AudioPath, 0, opts.Language, lr.WordTimestamps,
-			lr.VAD, 15, opts.batchSizeS(), true, opts.OnProgress)
+			lr.VAD, 15, opts.batchSizeS(), true, durMs, opts.OnProgress)
 		if err != nil {
 			return nil, nil, fmt.Errorf("E_ASR: %w", err)
 		}
@@ -119,7 +119,8 @@ func Analyze(opts AnalyzeOptions) (*ASRDoc, *Timeline, error) {
 			}
 			offMs := int64(off) * 1000 / engine.SampleRate
 			r, err := w.Transcribe(wavPath, offMs, opts.Language, lr.WordTimestamps,
-				false, 15, opts.batchSizeS(), true, opts.OnProgress)
+				false, 15, opts.batchSizeS(), true,
+				int64(end-off)*1000/engine.SampleRate, opts.OnProgress)
 			if err != nil {
 				return nil, nil, fmt.Errorf("E_ASR: chunk %d: %w", len(chunks), err)
 			}

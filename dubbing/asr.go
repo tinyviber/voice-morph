@@ -24,6 +24,10 @@ type ASRSegment struct {
 	Text       string    `json:"text"`
 	Confidence float64   `json:"confidence,omitempty"`
 	Words      []ASRWord `json:"words,omitempty"`
+	// Coarse marks a segment whose bounds were derived from chunk
+	// duration or token timestamps because the backend returned no
+	// sentence-level timings — boundaries on it are estimates.
+	Coarse     bool      `json:"coarse,omitempty"`
 }
 
 // ASRBackend describes what produced the transcript: which model, from

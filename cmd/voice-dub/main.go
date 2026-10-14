@@ -317,7 +317,10 @@ func runReconcile(args []string, stdout, stderr io.Writer) int {
 	tl.ASRFile = *asrP
 	if *merge {
 		if old, err := dubbing.LoadTimeline(filepath.Join(*outDir, "timeline-reviewed.json")); err == nil {
-			tl = dubbing.MergeReviewed(tl, old)
+			tl, err = dubbing.MergeReviewed(tl, old)
+			if err != nil {
+				return fail("reconcile", "E_REVIEW_STALE", err)
+			}
 		}
 	}
 	path := filepath.Join(*outDir, "timeline.json")
@@ -349,6 +352,7 @@ func runRender(args []string, stdout, stderr io.Writer) int {
 	only := fs.String("only", "", "逗号分隔的 segment_id/line_id 白名单")
 	audioP := fs.String("audio", "", "覆盖 timeline.audio 的音频路径（仍校验 sha256）")
 	src := fs.Bool("src", false, "每段附带原声切片 lines/src-<seg>.wav")
+	allowUnrev := fs.Bool("allow-unreviewed", false, "渲染仍待审核的片段（记 manifest warnings）")
 	keep := fs.Bool("keep-going", false, "单段失败继续")
 	jobs := fs.Int("jobs", 0, "并行渲染数")
 	if err := fs.Parse(args); err != nil {
@@ -367,6 +371,7 @@ func runRender(args []string, stdout, stderr io.Writer) int {
 	m, err := dubbing.Render(dubbing.RenderOptions{
 		TimelinePath: *tlP, VoicesPath: *voicesP, AudioPath: *audioP, OutDir: *outDir,
 		Only: onlySet, KeepGoing: *keep, Jobs: *jobs, WriteSrc: *src,
+		AllowUnreviewed: *allowUnrev,
 		OnProgress: func(d, t int) { fmt.Fprintf(stderr, "\r渲染 %d/%d", d, t) }})
 	if err != nil && m == nil {
 		code := "E_IO"

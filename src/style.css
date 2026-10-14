@@ -466,6 +466,7 @@ html, body {
 .btn.mini { padding: 2px 7px; font-size: 10.5px; }
 .btn.sm { padding: 4px 10px; font-size: 11.5px; }
 .meta.warn, .chip.warn { color: #a8641e; }
+.chip.bad { color: #b3261e; }
 .meta.warn:empty { display: none; }
 .manifest-foot { display: flex; gap: 8px; align-items: center; margin-top: 10px; flex-wrap: wrap; }
 .toast { position: fixed; right: 22px; bottom: 22px; background: var(--ink); color: var(--paper); padding: 10px 16px; border-radius: 9px; font-size: 12.5px; opacity: 0; transform: translateY(8px); transition: all .2s; pointer-events: none; max-width: 60%; }

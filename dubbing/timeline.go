@@ -22,6 +22,10 @@ const (
 	// false starts, off-script chatter). It is kept for review and never
 	// silently assigned a role.
 	MatchUnmatched = "unmatched"
+	// MatchManual means a human bound an unmatched segment to a role in
+	// review (an improvised line, or a line_id fill-in). It renders like
+	// a normal bound segment; Edited is always set on it.
+	MatchManual = "manual"
 )
 
 // Review reasons recorded in TimelineSegment.ReviewReasons.
@@ -149,11 +153,11 @@ func (t *Timeline) Validate() error {
 			return fmt.Errorf("timeline: segment %s has invalid range %d..%d", s.SegmentID, s.StartMs, s.EndMs)
 		}
 		switch s.MatchStatus {
-		case MatchExact, MatchModified, MatchRepeated, MatchUnmatched:
+		case MatchExact, MatchModified, MatchRepeated, MatchUnmatched, MatchManual:
 		default:
 			return fmt.Errorf("timeline: segment %s has unknown match_status %q", s.SegmentID, s.MatchStatus)
 		}
-		if s.MatchStatus != MatchUnmatched && s.LineID == "" {
+		if s.MatchStatus != MatchUnmatched && s.MatchStatus != MatchManual && s.LineID == "" {
 			return fmt.Errorf("timeline: segment %s bound to empty line_id", s.SegmentID)
 		}
 	}
