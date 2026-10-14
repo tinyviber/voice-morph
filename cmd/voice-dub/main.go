@@ -48,6 +48,9 @@ func fail(command, code string, err error) int {
 		Detail  string `json:"detail,omitempty"`
 	}{Code: code, Message: err.Error()}
 	emitJSON(os.Stdout, o)
+	if code == "E_USAGE" {
+		return 2
+	}
 	return 1
 }
 
