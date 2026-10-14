@@ -1,122 +1,84 @@
-# Offline neural voice-conversion evaluation (M3 exploration, 2026-10-14)
+# 离线神经变声评估（M3 探索，2026-10-14）
 
-This note records an offline comparison of VoiceMorph's DSP path against
-[Seed-VC v1](https://github.com/Plachtaa/seed-vc) (PyPI `seed-vc` 0.4.3,
-GPL-3.0) on real Chinese speech. Its purpose was to decide whether a
-neural path is worth pursuing — not to pick final parameters, and not to
-ship any converted audio.
+本次用真实中文语音，对比 VoiceMorph 的 DSP 路径与
+[Seed-VC v1](https://github.com/Plachtaa/seed-vc)，目的是判断是否继续探索离线神经变声。
+第二轮试听后，用户反馈：“所有片段的变体都挺不错的”。这支持继续探索该方向，尚不足以选出最佳参数或证明模型不会破音。
 
-**Nothing in this note is versioned in the repository.** The runs live in
-a throwaway directory outside the repo (`/tmp/vm-nn/`). No podcast audio,
-no converted output, no model weights and no Seed-VC code are committed
-here — the source material is copyrighted and the speakers' voices are
-protected, so this note only describes the setup and the verdicts. All
-model weights came from ModelScope mirrors and every Seed-VC run executed
-inside a network-denied sandbox with the HuggingFace hub offline, so no
-audio or credentials left the machine.
+本仓库只收录实验设置、反馈和结论。实验脚本、播客原音频、转换结果、模型权重与 Seed-VC 代码保留在仓库外的本地实验目录，不随本 PR 发布。神经模型尚未接入应用。
 
-## Setup
+## 实验设置
 
-- **Sources**: two male excerpts and one female excerpt (11–17 s each)
-  from the podcasts 故事FM E911/E896, plus a 7.75 s short phrase and a
-  21.97 s alternate reference cut from the same speaker. Sources were
-  attenuated −6 dB before DSP rendering so the engine's soft-clip knee
-  (0.9) never enters the comparison.
-- **Models** (CPU float32, seed 0):
-  - `DiT_seed_v2_uvit_whisper_small_wavenet_bigvgan_pruned` — 22.05 kHz
-    voice-conversion model, no F0 conditioning.
-  - `DiT_seed_v2_uvit_whisper_base_f0_44k_bigvgan_pruned_ft_ema_v2` —
-    44.1 kHz model **built for singing voice conversion** (RMVPE F0
-    conditioning). Defaults: 30 diffusion steps, CFG 0.7.
-- **Pitch controls**: `auto-f0` aligns the source median log-F0 to the
-  reference median, then a semitone shift is added on top. A
-  `--target-f0` mode pins the conditioned median explicitly.
-- **Pages**: locally generated blind pages (opaque `S<hash>` IDs, labels
-  behind a fold); 48 kHz playback, active-speech RMS aligned at
-  −23 dBFS, peaks capped at −1 dB. This is level matching, not loudness
-  matching, and a 22 kHz output keeps its bandwidth difference.
+- 源语音：故事FM E911 的两个男声片段（约 11.4 秒和 17.3 秒），以及 E896 的一个女声片段（约 15.75 秒）。男声 A 的具体说话人未确认；男声 B 是讲述者占有兵，女声是讲述者郭容非。
+- 目标参考：E896 中同一位女声的约 10.25 秒录音。女声源与参考属于同一说话人的不同片段。
+- 第二轮另外取男声 B 的前 7.75 秒作采样参数对照，并将目标参考延长至约 21.97 秒。
+- 源音频衰减 6 dB 后用于对比，以减少 DSP 输出触发引擎软限幅对试听的影响。此处理不能证明所有输出均无失真。
+- 代码：从阿里云 PyPI 镜像下载的 `seed-vc 0.4.3`（GPL-3.0）；权重来自 ModelScope。推理使用本地权重，在禁止网络访问的沙箱内运行，CPU float32，随机种子为 0。
 
-## Round 1 — screen all paths (single-blind, 23 clips)
+比较了两个模型：
 
-| Verdict | Conditions |
+| 模型 | 配置与用途 |
 |---|---|
-| Good | 22 kHz VC; 44.1k auto-F0 **+4 st**; originals |
-| Weird articulation / "AI" | 44.1k auto-F0 **+8 st** (both sources); the female +8 converted *to a same-speaker reference* sounded processed |
-| Audible electronics | legacy DSP `woman` (mild on male speech, 轻微电音), legacy `child` |
-| Obvious artifacts — dropped | DSP `natural-woman`, `natural-child`; `child` on the female source (pitch "unlike a human") |
+| `DiT_seed_v2_uvit_whisper_small_wavenet_bigvgan_pruned` | 22.05 kHz 语音转换模型，无显式 F0 条件 |
+| `DiT_seed_v2_uvit_whisper_base_f0_44k_bigvgan_pruned_ft_ema_v2` | 44.1 kHz 歌声转换模型，使用 RMVPE 提取 F0；本实验将其用于说话声 |
 
-Read of round 1, after correcting earlier over-claims (see caveats
-below): the artifacts users notice in the DSP presets are not a pitch
-problem — they are spectral-envelope and PSOLA-artifact problems.
->+8 semitones *on top of auto-F0 alignment* on the male source is roughly
-a 12-semitone net shift and produced the clearest articulation issues,
-but it is a dose, not a hard boundary.
+两者架构和训练用途不同，听感差异不能只归因于采样率。默认采样设置为 30 步、CFG 0.7。
 
-## Round 2 — one-factor controls (two pages, 22 clips)
+`auto-f0` 先将源语音的 log-F0 中位数对齐参考，再叠加指定半音偏移。因此“auto-f0 后 +8”并不等于源声音高只升 8 个半音。以男声 B 为例，源中位 F0 约 133.3 Hz，参考约 167.8 Hz，对齐后再加 8 半音，条件中位 F0 约为 266.3 Hz，净变化约 12 半音。
 
-Design in `/tmp/vm-nn/docs/round2-experiment.md`; every run was a single
-context chunk, verified conditioned medians tracked the requested
-targets (±0.02 Hz), and no frame exceeded the 1103 Hz F0-quantization
-quirk in `seed_vc/length_regulator.py`.
+试听页使用不透露参数的样本编号，映射折叠在页面下方；播放文件统一为 48 kHz，按有声段 RMS 对齐至 −23 dBFS，峰值限制在 −1 dB。峰值约束可能使部分样本低于目标 RMS。这不是严格的感知响度匹配，也不能补足 22.05 kHz 模型的带宽。
 
-| Group | Axes | Conditions |
-|---|---|---|
-| Pitch, 44.1k auto-F0 | semitones | male +4 / +6 / +8; female +2 / +4 / +8 |
-| Voice conversion | model | female 22 kHz VC alongside 44.1k |
-| Reference length | seconds of same speaker | 10.25 s vs 21.97 s, target F0 fixed at 211.4 Hz |
-| Classifier-free guidance | CFG | 0 / 0.3 / 0.7 |
-| Diffusion steps | steps | 30 vs 50 |
+## 第一轮反馈
 
-**User verdict: every variant sounded acceptable.** With a single
-listener, that means the discriminative axis in this experiment is
-roughly the audibility floor reached around 30 steps/CFG 0.7/short
-reference — none of the lowered settings (CFG 0, CFG 0.3, 30 steps,
-10.25 s reference) produced an obvious failure either. Round-2 clips
-are short and single-condition; they cannot tell +6 from +8 as
-consistently as the longer round-1 sentences did.
+第一轮比较原声、DSP 预设与神经转换。以下为用户对具体样本的主观反馈，不能推广为模型在所有输入上的表现。
 
-## What this means for VoiceMorph
+| 条件 | 反馈 |
+|---|---|
+| 男声 B：22.05 kHz VC、44.1 kHz auto-f0 后 +4 | “挺好的” |
+| 男声 A：44.1 kHz auto-f0 后 +8 | 大体没问题，个别咬字音高偏高 |
+| 男声 B：44.1 kHz auto-f0 后 +8 | 总体还行，但很多咬字奇怪 |
+| 女声：44.1 kHz auto-f0 后 +8，同说话人参考 | 容易听出 AI 处理 |
+| 男声 B：旧 DSP `woman` | 轻微电音，总体不错 |
+| 多个 DSP `child`、`natural-woman`、`natural-child` 样本 | 有明显电音、机械音，或音高不自然；第二轮不再纳入这些 DSP 条件 |
 
-1. **The DSP path's remaining complaints are timbre artifacts, not
-   reachable by more pitch-law tuning.** The neural condition that keeps
-   naturalness across +4…+8 shifts is exactly what a spectral-envelope
-   warp cannot deliver; this supports keeping M3 as the direction.
-2. **Offline first is safe.** Conversion ran at ~5.8–11.3× the clip's
-   duration on this machine (Intel i7-14700KF, CPU float32, 30 steps;
-   e.g. ~86 s for the 7.7 s clip, ~195 s for the 17.3 s one, ~91 s for
-   the 15.7 s 22 kHz model), and ~25× with a 22 s reference — so neural
-   VC is an offline render or a longer-pipeline feature, not a drop-in
-   for the ~107 ms monitor path.
-3. **Cheapest operating point found** so far: 44.1k F0 model,
-   auto-F0 +4 st on male sources, CFG 0.7, 30 steps, ~10 s reference.
-   That is a starting point for a quality floor test, not a conclusion —
-   the knobs were only sampled once each and only short clips were
-   heard.
+这些反馈显示神经转换值得继续测试，但没有定位 DSP 电音或神经模型咬字异常的确定根因。用户已经暂停 DSP 修复；相关预设仍保留在代码中作为已有实现与评测基线。
 
-## Caveats and open issues
+## 第二轮：控制变量
 
-- **Not a strong blind test**: one listener, small n, sources are
-  copyrighted podcasts rather than target users' voices, and there is
-  still **no child reference** — adult→child quality is unvalidated.
-- **Model provenance**: Seed-VC is GPL-3.0 research code; the 44.1k
-  checkpoint is tuned for singing. Either fact alone could bar a
-  productized integration; this experiment does not settle licensing or
-  latency, only that offline quality clears the DSP path's issues.
-- **Confirmed-only framing**: the earlier write-up
-  (`/tmp/vm-nn/docs/parameter-diagnosis-2026-10-14.md`) overclaimed some
-  boundaries (e.g. "±6 st breaks", "10 s reference too short",
-  "reference median = pitch ceiling"). Round 2 deliberately re-tested
-  those and none held up as universal limits; what remains true is that
-  larger net shifts degrade articulation.
-- The 22 kHz output retains a bandwidth limitation you can hear on
-  headphones; level-matching does not hide it.
+新增 10 个转换任务，生成两个页面、共 22 条试听卡；其中包含原声和复用的基线音频。音高组沿用第一轮的源片段，参考、CFG 和步数组使用约 7.75 秒的短源片段。
 
-## Next candidates if M3 proceeds
+| 对照因素 | 设置 |
+|---|---|
+| 男声音高 | 两段男声各比较 44.1 kHz auto-f0 后 +4 / +6 / +8 |
+| 女声音高与模型 | 44.1 kHz auto-f0 后 +2 / +4 / +8，以及 22.05 kHz VC |
+| 参考长度 | 10.25 秒与 21.97 秒；固定目标条件 F0 中位数为 211.4 Hz |
+| CFG | 0 / 0.3 / 0.7，其余使用同一短源、短参考和目标 F0 |
+| 扩散步数 | 30 / 50，其余设置相同 |
 
-- Repeat the floor test with **sentence-length sources** (the current
-  clips end mid-paragraph in one case) and a **second listener**, then
-  try `steps=20`/`cfg=0.3` to find where quality actually collapses.
-- A child speaker target needs licensed child speech before any
-  child-voice claim can be evaluated.
-- Any product decision also needs a license answer for GPL-3.0 Seed-VC
-  (or an alternative checkpoint) before code enters this repository.
+新增任务均为单块输出。校验检查了任务参数、时长、非空音频、条件 F0 和页面音频链接。保存的条件 F0 轨迹没有超过约 1103 Hz 的帧，未触发已发现的上游高 F0 量化边界问题。这里验证的是传入模型的条件 F0，不代表生成波形的实测 F0 完全一致。
+
+少数原始输出有满幅越界样本（22.05 kHz 女声输出为 13 个，其余新增输出最多 3 个）。试听页统一降电平不能恢复此前写入 PCM 时可能发生的削波；这些计数也不能单独解释咬字异常。
+
+**用户的整体反馈是所有片段的变体都不错。** 用户没有逐条排序，也未表示偏好某个 CFG、参考长度、步数或移调量。因此本轮没有选出最佳或最低成本配置，也不能据此撤销第一轮对特定咬字的反馈。
+
+## 性能观察
+
+下表来自本机 Intel i7-14700KF、CPU float32 的第二轮记录。转换计时不包含初始模型加载，单次测量不能作为稳定性能基准。
+
+| 条件 | 输出时长 | 转换耗时 | 耗时 / 输出时长 |
+|---|---:|---:|---:|
+| 女声 22.05 kHz、30 步 | 15.74 秒 | 90.8 秒 | 5.8 倍 |
+| 短句 44.1 kHz、CFG 0.7、30 步 | 7.74 秒 | 86.1 秒 | 11.1 倍 |
+| 同短句、CFG 0.3 | 7.74 秒 | 85.6 秒 | 11.1 倍 |
+| 同短句、CFG 0 | 7.74 秒 | 49.7 秒 | 6.4 倍 |
+| 同短句、50 步 | 7.74 秒 | 133.2 秒 | 17.2 倍 |
+| 同短句、参考延长至 21.97 秒 | 7.74 秒 | 196.0 秒 | 25.3 倍 |
+
+这些实测耗时适合继续做离线评估；尚未验证 GPU 表现或实时部署能力。
+
+## 结论与后续建议
+
+1. 本次短语音试听支持继续探索离线神经变声。它没有证明神经模型能避免所有破音，也没有证明 DSP 的剩余问题无法改进。
+2. 保留 22.05 kHz VC 和 44.1 kHz F0 模型作为候选：前者用于语音转换基线，后者用于需要显式音高控制的对比。30 步、CFG 0.7、约 10 秒参考可作为已测试的基线；CFG 0 是值得复测的较快候选，尚未选为默认。
+3. 不能把 ±6 半音当成统一稳定边界，不能把参考 F0 中位数当成音域上限，也不能认定 10 秒参考过短。加长参考同时改变了语音内容、发音覆盖与韵律，其效果不能只归因于时长。
+4. 后续应在更长片段、分块边界、更多说话人和重复随机种子上复测，记录具体咬字与失真时间点。当前结果只有一位听者、少量成人语音，没有授权的儿童目标参考，不能宣称真实童声转换质量已通过验证。
+5. 实际接入前应核对 Seed-VC 代码及各模型、依赖的许可和发布方式。本 PR 仅保存实验结论，不引入神经转换代码。
