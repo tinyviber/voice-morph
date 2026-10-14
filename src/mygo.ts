@@ -112,3 +112,86 @@ export const Morpher = {
     return call("Morpher.SetParams", p);
   },
 } as const;
+
+/**
+ * Dubber is the bound service behind the 离线配音 workspace. Methods
+ * take and return plain JSON strings so the generated mygo bridge
+ * stays simple; the Go side always validates before touching disk.
+ */
+export const Dubber = {
+  /**
+   * Analyze runs ASR (+reconcile when script is non-empty). It blocks
+   * for the duration — the UI awaits it and shows progress text.
+   */
+  analyze(audio: string, script: string, outDir: string, modelDir: string): Promise<string> {
+    return call("Dubber.Analyze", audio, script, outDir, modelDir);
+  },
+  /** DefaultVoices returns a starter voices.json for the session. */
+  defaultVoices(): Promise<string> {
+    return call("Dubber.DefaultVoices");
+  },
+  /** LoadTextFile reads a UTF-8 text file (voices.json, script.json). */
+  loadTextFile(path: string): Promise<string> {
+    return call("Dubber.LoadTextFile", path);
+  },
+  /** LoadTimelineFile returns a validated timeline for the review UI. */
+  loadTimelineFile(path: string): Promise<string> {
+    return call("Dubber.LoadTimelineFile", path);
+  },
+  /** Message shows a native message box (e.g. model missing guidance). */
+  message(title: string, content: string): Promise<void> {
+    return call("Dubber.Message", title, content);
+  },
+  /** ModelStatus reports the resolved model (or "missing"). */
+  modelStatus(): Promise<string> {
+    return call("Dubber.ModelStatus");
+  },
+  /** OpenPath reveals a file/dir in the OS file manager. */
+  openPath(path: string): Promise<string> {
+    return call("Dubber.OpenPath", path);
+  },
+  pickDirectory(title: string): Promise<string> {
+    return call("Dubber.PickDirectory", title);
+  },
+  /**
+   * PickFile opens a native open dialog; exts is a comma list like
+   * "wav,json" (empty = any). Returns "" when cancelled.
+   */
+  pickFile(title: string, exts: string): Promise<string> {
+    return call("Dubber.PickFile", title, exts);
+  },
+  /**
+   * PresetList exposes engine presets so the UI can label them honestly
+   * (experimental ones stay marked 实验).
+   */
+  presetList(): Promise<string> {
+    return call("Dubber.PresetList");
+  },
+  /** ReadFileB64 lets the webview play per-segment audio from disk. */
+  readFileB64(path: string): Promise<string> {
+    return call("Dubber.ReadFileB64", path);
+  },
+  /** Render runs the batch render and returns the manifest. */
+  render(timelinePath: string, voicesPath: string, outDir: string): Promise<string> {
+    return call("Dubber.Render", timelinePath, voicesPath, outDir);
+  },
+  /** SaveTextFile writes a UTF-8 text file atomically. */
+  saveTextFile(path: string, payload: string): Promise<string> {
+    return call("Dubber.SaveTextFile", path, payload);
+  },
+  /**
+   * SaveTimelineFile persists the user's reviewed timeline. The payload
+   * must be a complete, valid timeline JSON document.
+   */
+  saveTimelineFile(path: string, payload: string): Promise<string> {
+    return call("Dubber.SaveTimelineFile", path, payload);
+  },
+  /** ScanModels lists every candidate dir with its evidence. */
+  scanModels(): Promise<string> {
+    return call("Dubber.ScanModels");
+  },
+  /** SetModel validates + persists a model dir picked in the UI. */
+  setModel(dir: string, vadDir: string): Promise<string> {
+    return call("Dubber.SetModel", dir, vadDir);
+  },
+} as const;

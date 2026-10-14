@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "lines": [
+    {"line_id": "l01", "scene_id": "s1", "role_id": "narrator", "text": "大家好，我们开始吧"},
+    {"line_id": "l02", "scene_id": "s1", "role_id": "character-a", "text": "等一下"},
+    {"line_id": "l03", "scene_id": "s1", "role_id": "character-a", "text": "马上就好"},
+    {"line_id": "l04", "scene_id": "s1", "role_id": "narrator", "text": "我们下午再练"}
+  ]
+}

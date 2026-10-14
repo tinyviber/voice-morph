@@ -208,6 +208,7 @@ func resampleTo(in []float32, from, to int) []float32 {
 
 func main() {
 	mygo.Bind(&Morpher{eng: engine.New(), lastSeq: -1})
+	mygo.Bind(&Dubber{})
 
 	mygo.App.WhenReady(func() {
 		mygo.NewWindow(mygo.WindowOptions{

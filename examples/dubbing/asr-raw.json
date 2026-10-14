@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "audio": "take.wav",
+  "audio_sha256": "bfb639f177234fcd380ca5af4eef90e4b9bd5cfb1f59ffb5362600293809bf6c",
+  "sample_rate": 48000,
+  "duration_ms": 12000,
+  "backend": {
+    "name": "funasr",
+    "version": "fixture",
+    "model_path": "fixture (SenseVoiceSmall 在真机替换)",
+    "language": "zh",
+    "word_timestamps": false,
+    "confidence": false,
+    "vad": true
+  },
+  "segments": [
+    {"segment_id": "seg-0001", "start_ms": 500, "end_ms": 2500, "text": "大家好我们开始吧"},
+    {"segment_id": "seg-0002", "start_ms": 3000, "end_ms": 4000, "text": "广告时间到"},
+    {"segment_id": "seg-0003", "start_ms": 5000, "end_ms": 6500, "text": "等下啊"},
+    {"segment_id": "seg-0004", "start_ms": 7500, "end_ms": 9000, "text": "马上就"},
+    {"segment_id": "seg-0005", "start_ms": 9500, "end_ms": 11500, "text": "马上就好"}
+  ]
+}

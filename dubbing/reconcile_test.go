@@ -1,0 +1,393 @@
+package dubbing
+
+import (
+	"testing"
+)
+
+func scriptOf(lines ...[3]string) *Script {
+	s := &Script{Version: 1}
+	for i, l := range lines {
+		s.Lines = append(s.Lines, ScriptLine{
+			LineID:  "l" + itoa(i+1),
+			SceneID: l[0],
+			RoleID:  l[1],
+			Text:    l[2],
+		})
+	}
+	if err := s.Validate(); err != nil {
+		panic(err)
+	}
+	return s
+}
+
+func itoa(i int) string {
+	if i < 10 {
+		return "0" + string(rune('0'+i))
+	}
+	return string(rune('0'+i/10)) + string(rune('0'+i%10))
+}
+
+func asrOf(segs ...[3]any) *ASRDoc {
+	d := &ASRDoc{Version: 1, Audio: "take.wav", SampleRate: 48000}
+	for i, s := range segs {
+		d.Segments = append(d.Segments, ASRSegment{
+			SegmentID: "seg-" + itoa(i+1),
+			StartMs:   s[0].(int),
+			EndMs:     s[1].(int),
+			Text:      s[2].(string),
+		})
+		if d.DurationMs < s[1].(int) {
+			d.DurationMs = s[1].(int)
+		}
+	}
+	if err := d.Validate(); err != nil {
+		panic(err)
+	}
+	return d
+}
+
+func bound(t *testing.T, tl *Timeline) []TimelineSegment {
+	t.Helper()
+	return tl.Segments
+}
+
+func findByLine(tl *Timeline, lineID string) []TimelineSegment {
+	var out []TimelineSegment
+	for _, s := range tl.Segments {
+		if s.LineID == lineID {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// 完全一致
+func TestReconcileExact(t *testing.T) {
+	sc := scriptOf(
+		[3]string{"s01", "narrator", "他以为自己已经掌握了秘诀。"},
+		[3]string{"s01", "character-a", "等等，我们明天再去训练。"},
+	)
+	asr := asrOf(
+		[3]any{0, 3000, "他以为自己已经掌握了秘诀"},
+		[3]any{4000, 8000, "等等我们明天再去训练"},
+	)
+	tl, err := Reconcile(sc, asr, DefaultReconcileOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	segs := bound(t, tl)
+	if len(segs) != 2 {
+		t.Fatalf("want 2 segments, got %d: %+v", len(segs), segs)
+	}
+	if segs[0].LineID != "l01" || segs[1].LineID != "l02" {
+		t.Fatalf("wrong binding: %+v", segs)
+	}
+	if segs[0].MatchStatus != MatchExact || segs[1].MatchStatus != MatchExact {
+		t.Fatalf("want exact: %s %s", segs[0].MatchStatus, segs[1].MatchStatus)
+	}
+	if segs[0].RoleID != "narrator" || segs[1].RoleID != "character-a" {
+		t.Fatalf("wrong roles: %+v", segs)
+	}
+	if segs[1].StartMs != 4000 || segs[1].EndMs != 8000 {
+		t.Fatalf("times not from audio: %+v", segs[1])
+	}
+	if tl.ReviewCount != 0 || len(tl.UnmatchedLines) != 0 {
+		t.Fatalf("unexpected review items: %d %+v", tl.ReviewCount, tl.UnmatchedLines)
+	}
+}
+
+// 同义改写：等→等一下、明天→明天下午、句尾加"吧"
+func TestReconcileModified(t *testing.T) {
+	sc := scriptOf(
+		[3]string{"s01", "narrator", "他以为自己已经掌握了秘诀。"},
+		[3]string{"s01", "character-a", "等等，我们明天再去训练。"},
+	)
+	asr := asrOf(
+		[3]any{0, 3000, "他以为自己已经掌握了秘诀"},
+		[3]any{4000, 8000, "等一下我们明天下午再去训练吧"},
+	)
+	tl, err := Reconcile(sc, asr, DefaultReconcileOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := findByLine(tl, "l02")
+	if len(s) != 1 {
+		t.Fatalf("want 1 bound seg, got %+v", tl.Segments)
+	}
+	if s[0].MatchStatus != MatchModified {
+		t.Fatalf("want modified, got %s", s[0].MatchStatus)
+	}
+	// 实际朗读内容保留，不被台本覆盖
+	if s[0].SpokenText != "等一下我们明天下午再去训练吧" {
+		t.Fatalf("spoken text overwritten by script: %q", s[0].SpokenText)
+	}
+	if s[0].RoleID != "character-a" {
+		t.Fatalf("wrong role: %s", s[0].RoleID)
+	}
+}
+
+// 漏字漏词
+func TestReconcileDroppedWords(t *testing.T) {
+	sc := scriptOf(
+		[3]string{"s01", "a", "明天下午我们去操场训练"},
+	)
+	asr := asrOf([3]any{0, 3000, "明天我们去训练"})
+	tl, _ := Reconcile(sc, asr, DefaultReconcileOptions())
+	s := findByLine(tl, "l01")
+	if len(s) != 1 || s[0].MatchStatus != MatchModified {
+		t.Fatalf("want modified binding, got %+v", tl.Segments)
+	}
+	if s[0].Similarity >= 0.98 {
+		t.Fatalf("similarity too high for dropped words: %v", s[0].Similarity)
+	}
+}
+
+// 整句漏读
+func TestReconcileSkippedLine(t *testing.T) {
+	sc := scriptOf(
+		[3]string{"s01", "narrator", "开场白第一句"},
+		[3]string{"s01", "a", "被漏掉的中间句"},
+		[3]string{"s01", "b", "收尾的最后一句台词"},
+	)
+	asr := asrOf(
+		[3]any{0, 2000, "开场白第一句"},
+		[3]any{3000, 6000, "收尾的最后一句台词"},
+	)
+	tl, _ := Reconcile(sc, asr, DefaultReconcileOptions())
+	if len(tl.UnmatchedLines) != 1 || tl.UnmatchedLines[0].LineID != "l02" {
+		t.Fatalf("skipped line not detected: %+v", tl.UnmatchedLines)
+	}
+	if tl.UnmatchedLines[0].Reason != "no_audio" {
+		t.Fatalf("bad reason: %s", tl.UnmatchedLines[0].Reason)
+	}
+	if n := len(findByLine(tl, "l03")); n != 1 {
+		t.Fatalf("l03 not bound: %+v", tl.Segments)
+	}
+}
+
+// 整句重复朗读 → 保留全部候选 take，推荐一个，存疑时标记
+func TestReconcileRepeatedTake(t *testing.T) {
+	sc := scriptOf(
+		[3]string{"s01", "a", "我们今天去爬山"},
+		[3]string{"s01", "b", "明天的安排再说"},
+	)
+	asr := asrOf(
+		[3]any{0, 2000, "我们今天去"},       // 读了一半
+		[3]any{2500, 5000, "我们今天去爬山"}, // 重读完整
+		[3]any{6000, 9000, "明天的安排再说"},
+	)
+	tl, _ := Reconcile(sc, asr, DefaultReconcileOptions())
+	takes := findByLine(tl, "l01")
+	if len(takes) != 2 {
+		t.Fatalf("want 2 take candidates, got %+v", tl.Segments)
+	}
+	sel, other := 0, 0
+	for _, tk := range takes {
+		if tk.MatchStatus != MatchRepeated {
+			t.Fatalf("take not marked repeated: %+v", tk)
+		}
+		if tk.Selected {
+			sel++
+			if tk.SpokenText != "我们今天去爬山" {
+				t.Fatalf("wrong take selected: %+v", tk)
+			}
+		} else {
+			other++
+		}
+	}
+	if sel != 1 || other != 1 {
+		t.Fatalf("take selection wrong: %+v", takes)
+	}
+	if n := len(findByLine(tl, "l02")); n != 1 {
+		t.Fatalf("l02 not bound: %+v", tl.Segments)
+	}
+}
+
+// 台词被停顿拆成两个语音段 → 同一 line_id 的两个片段
+func TestReconcileLineSplitAcrossSegments(t *testing.T) {
+	sc := scriptOf(
+		[3]string{"s01", "a", "我们今天下午去操场训练"},
+		[3]string{"s01", "b", "好的没问题"},
+	)
+	asr := asrOf(
+		[3]any{0, 2000, "我们今天下午"},
+		[3]any{3000, 5000, "去操场训练"},
+		[3]any{6000, 7500, "好的没问题"},
+	)
+	tl, _ := Reconcile(sc, asr, DefaultReconcileOptions())
+	parts := findByLine(tl, "l01")
+	if len(parts) != 2 {
+		t.Fatalf("want 2 parts, got %+v", tl.Segments)
+	}
+	for _, p := range parts {
+		if !p.Selected || p.TakeIndex != 0 {
+			t.Fatalf("part wrongly flagged as take: %+v", p)
+		}
+	}
+	if parts[0].EndMs > parts[1].StartMs {
+		t.Fatalf("parts overlap")
+	}
+}
+
+// 两个角色在一个语音段内紧邻 → 边界拆分并标记估算
+func TestReconcileTwoRolesOneSegment(t *testing.T) {
+	sc := scriptOf(
+		[3]string{"s01", "a", "你明天来吗"},
+		[3]string{"s01", "b", "我一定准时到"},
+	)
+	asr := asrOf(
+		[3]any{0, 4000, "你明天来吗我一定准时到"}, // 一口气读了两句
+	)
+	tl, _ := Reconcile(sc, asr, DefaultReconcileOptions())
+	a := findByLine(tl, "l01")
+	b := findByLine(tl, "l02")
+	if len(a) != 1 || len(b) != 1 {
+		t.Fatalf("want both lines bound, got %+v", tl.Segments)
+	}
+	if a[0].RoleID != "a" || b[0].RoleID != "b" {
+		t.Fatalf("roles wrong: %+v %+v", a[0], b[0])
+	}
+	if a[0].EndMs <= a[0].StartMs || b[0].StartMs < a[0].EndMs {
+		t.Fatalf("boundary wrong: %+v %+v", a[0], b[0])
+	}
+	if b[0].Boundary != "estimated" && b[0].Boundary != "word" {
+		t.Fatalf("interior boundary should be estimated/word: %s", b[0].Boundary)
+	}
+	if !b[0].ReviewRequired {
+		t.Fatalf("interior boundary should be flagged for review")
+	}
+	if a[0].ASRSegmentID != b[0].ASRSegmentID {
+		t.Fatalf("should share asr segment: %s %s", a[0].ASRSegmentID, b[0].ASRSegmentID)
+	}
+}
+
+// 不匹配内容：编排外的口播保留为 unmatched 并标记审核，不猜角色
+func TestReconcileUnmatchedAudio(t *testing.T) {
+	sc := scriptOf(
+		[3]string{"s01", "a", "今天天气不错"},
+		[3]string{"s01", "b", "我们出发吧"},
+	)
+	asr := asrOf(
+		[3]any{0, 1500, "今天天气不错"},
+		[3]any{2000, 3000, "哎呀我刚才走神了"}, // 题外话
+		[3]any{4000, 5500, "我们出发吧"},
+	)
+	tl, _ := Reconcile(sc, asr, DefaultReconcileOptions())
+	var un []TimelineSegment
+	for _, s := range tl.Segments {
+		if s.MatchStatus == MatchUnmatched {
+			un = append(un, s)
+		}
+	}
+	if len(un) != 1 {
+		t.Fatalf("want 1 unmatched, got %+v", tl.Segments)
+	}
+	if un[0].RoleID != "" {
+		t.Fatalf("unmatched seg must not get a guessed role: %+v", un[0])
+	}
+	if un[0].Selected {
+		t.Fatalf("unmatched seg must not render")
+	}
+	if !un[0].ReviewRequired {
+		t.Fatalf("unmatched seg must require review")
+	}
+	// 顺序正确：unmatched 夹在两条绑定之间
+	if tl.Segments[1].MatchStatus != MatchUnmatched {
+		t.Fatalf("order broken: %+v", tl.Segments)
+	}
+}
+
+// ASR 原始证据保留：asr_raw 不被台本覆盖
+func TestReconcilePreservesASREvidence(t *testing.T) {
+	sc := scriptOf([3]string{"s01", "a", "我们明天去训练"})
+	asr := asrOf([3]any{0, 3000, "我们后天去训练"})
+	tl, _ := Reconcile(sc, asr, DefaultReconcileOptions())
+	s := tl.Segments[0]
+	if s.ASRRaw != "我们后天去训练" || s.SpokenText != "我们后天去训练" {
+		t.Fatalf("asr evidence lost: %+v", s)
+	}
+	if s.ScriptText != "我们明天去训练" {
+		t.Fatalf("script text lost: %+v", s)
+	}
+	if s.MatchStatus != MatchModified {
+		t.Fatalf("substitution should be modified: %s", s.MatchStatus)
+	}
+}
+
+// 多句连续朗读在一个段里（同一角色）：按行切开
+func TestReconcileMultiLineOneSegment(t *testing.T) {
+	sc := scriptOf(
+		[3]string{"s01", "a", "第一句台词"},
+		[3]string{"s01", "a", "第二句台词"},
+		[3]string{"s01", "a", "第三句台词"},
+	)
+	asr := asrOf([3]any{0, 6000, "第一句台词第二句台词第三句台词"})
+	tl, _ := Reconcile(sc, asr, DefaultReconcileOptions())
+	for _, id := range []string{"l01", "l02", "l03"} {
+		if n := len(findByLine(tl, id)); n != 1 {
+			t.Fatalf("line %s not bound: %+v", id, tl.Segments)
+		}
+	}
+	// 时间单调不重叠
+	prev := -1
+	for _, s := range tl.Segments {
+		if s.StartMs < prev {
+			t.Fatalf("segments overlap: %+v", tl.Segments)
+		}
+		prev = s.StartMs
+	}
+}
+
+// 口误后重录：错误开头 + 完整重读
+func TestReconcileFalseStartThenRetake(t *testing.T) {
+	sc := scriptOf([3]string{"s01", "a", "我们明天下午去训练"})
+	asr := asrOf(
+		[3]any{0, 1000, "我们明"},           // 口误中止
+		[3]any{1500, 5000, "我们明天下午去训练"}, // 重读
+	)
+	tl, _ := Reconcile(sc, asr, DefaultReconcileOptions())
+	takes := findByLine(tl, "l01")
+	if len(takes) != 2 {
+		t.Fatalf("want false-start + retake as 2 candidates, got %+v", tl.Segments)
+	}
+	sel := 0
+	for _, tk := range takes {
+		if tk.Selected {
+			sel++
+			if tk.EndMs != 5000 {
+				t.Fatalf("should select full retake: %+v", tk)
+			}
+		}
+	}
+	if sel != 1 {
+		t.Fatalf("no take selected")
+	}
+}
+
+// 台本之外的大段口播 + 低置信度
+func TestReconcileLowConfidenceFlag(t *testing.T) {
+	sc := scriptOf([3]string{"s01", "a", "今天天气不错"})
+	d := asrOf([3]any{0, 1500, "今田天气不错"})
+	d.Segments[0].Confidence = 0.3
+	tl, _ := Reconcile(sc, d, DefaultReconcileOptions())
+	s := tl.Segments[0]
+	found := false
+	for _, r := range s.ReviewReasons {
+		if r == ReviewLowASRConfidence {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("low asr confidence not flagged: %+v", s.ReviewReasons)
+	}
+}
+
+// 保存/加载 round-trip
+func TestTimelineRoundTrip(t *testing.T) {
+	sc := scriptOf([3]string{"s01", "a", "我们明天去训练"})
+	asr := asrOf([3]any{0, 3000, "我们明天去训练"})
+	tl, _ := Reconcile(sc, asr, DefaultReconcileOptions())
+	if err := tl.Validate(); err != nil {
+		t.Fatalf("emitted timeline invalid: %v", err)
+	}
+}
