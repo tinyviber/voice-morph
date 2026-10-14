@@ -2,13 +2,18 @@
 //
 //	pre-EQ → pitch shift → timbre (formant) shift → post-EQ → gain/limiter
 //
-// Pitch shift is resample + WSOLA time-stretch: resampling by r scales
-// pitch and formants together while shrinking the duration, and WSOLA
-// stretches the result back to the original length. The formant stage
-// then warps the spectral envelope by w/r, so the net formant shift is
-// w alone — pitch moves f0 only, timbre moves formants only: the two
+// The legacy pitch shift is resample + WSOLA time-stretch: resampling by r
+// scales pitch and formants together while shrinking the duration, and
+// WSOLA stretches the result back to the original length. The formant
+// stage then warps the spectral envelope by w/r, so the net formant shift
+// is w alone — pitch moves f0 only, timbre moves formants only: the two
 // knobs are orthogonal, the MorphVOX split of "pitch" vs "harmonic
 // quality".
+//
+// Params.Speech selects the speech path instead (SpeechChain): a YIN
+// pitch tracker drives 1:1 TD-PSOLA on voiced frames only, so fricatives
+// and breath keep their original spectrum, and an F0-adaptive envelope
+// warp with a nonuniform vocal-tract map moves the formants.
 package engine
 
 import (
@@ -51,32 +56,54 @@ var prewarmLen = 8192
 // strength 0..1, plus a 10-band graphic EQ on both sides of the morph.
 type Params struct {
 	Pitch    float64     `json:"pitch"`    // octaves, -1..1 (ratio = 2^pitch)
-	Timbre   float64     `json:"timbre"`   // formant warp, -1..1 (ratio = 2^timbre)
+	Timbre   float64     `json:"timbre"`   // formant amount, -1..1 (ratio = 2^timbre)
 	Strength float64     `json:"strength"` // timbre amount, 0..1
 	Gain     float64     `json:"gain"`     // output gain 0..2
 	Bypass   bool        `json:"bypass"`   // dry pass-through
 	EqPre    [10]float64 `json:"eqPre"`    // dB per band
 	EqPost   [10]float64 `json:"eqPost"`   // dB per band
+	Speech   bool        `json:"speech"`   // speech-aware analysis path
+	// PitchRange scales voiced F0 deviations around the target center:
+	// 1 preserves, 0 monotonizes, >1 exaggerates intonation.
+	PitchRange float64 `json:"pitchRange"`
+	// TargetF0 is the voiced F0 center in Hz; 0 derives it from the source
+	// estimate plus the legacy pitch offset. Explicit presets set it to
+	// 70..500 so a voice is not tied to the input speaker's own register.
+	TargetF0 float64 `json:"targetF0"`
+	// FormantShape interpolates the neutral piecewise vocal-tract warp:
+	// -1 giant/low frequencies, +1 child/short vocal tract, 0 neutral.
+	FormantShape float64 `json:"formantShape"`
 }
 
 // DefaultParams is the neutral voice.
-var DefaultParams = Params{Strength: 1, Gain: 1}
+var DefaultParams = Params{Strength: 1, Gain: 1, PitchRange: 1}
 
-// morphChain bundles the stages that are rebuilt together on a morph
-// parameter change: resampler + WSOLA (pitch) + formant warp (timbre).
-type morphChain struct {
+// morphChain is one analysis/synthesis path through the morph section.
+// Every implementation preserves the input timeline 1:1 and declares its
+// input→output content offset so fades and Render alignment stay causal.
+type morphChain interface {
+	Process([]float64) []float64
+	Flush() []float64
+	// Offset returns the position label to subtract from produced samples.
+	Offset() int
+}
+
+// legacyChain bundles the resample + WSOLA pitch pair and the uniform
+// formant warp used by the classic presets.
+type legacyChain struct {
 	res  *Resampler
 	wso  *WSOLA
 	form *Formant
+	off  int
 }
 
-func (c *morphChain) process(x []float64) []float64 {
+func (c *legacyChain) Process(x []float64) []float64 {
 	x = c.res.Process(x)
 	x = c.wso.Process(x)
 	return c.form.Process(x)
 }
 
-func (c *morphChain) flush() []float64 {
+func (c *legacyChain) Flush() []float64 {
 	x := c.res.Flush()
 	x = c.wso.Process(x)
 	x = append(x, c.wso.Flush()...)
@@ -84,11 +111,13 @@ func (c *morphChain) flush() []float64 {
 	return append(x, c.form.Flush()...)
 }
 
+func (c *legacyChain) Offset() int { return c.off }
+
 // side is one branch of the morph-section crossfade: a full chain, or
 // the unmodified signal while pitch and timbre are neutral
 // (chain == nil, the transparent "原声" path).
 type side struct {
-	chain *morphChain
+	chain morphChain
 	q     []float64 // emitted output not yet consumed by the fader
 	pos   int       // absolute input position covered by q[0]; both
 	// chains preserve the input timeline 1:1, so pos advances exactly
@@ -98,7 +127,7 @@ type side struct {
 
 func (s *side) push(x []float64) {
 	if s.chain != nil {
-		x = s.chain.process(x)
+		x = s.chain.Process(x)
 	}
 	s.q = append(s.q, x...)
 }
@@ -145,19 +174,35 @@ func (e *Engine) SetParams(p Params) {
 	e.setParamsLocked(p)
 }
 
-func (e *Engine) setParamsLocked(p Params) {
+// normalized clamps every field to its documented range.
+func (p Params) normalized() Params {
 	p.Pitch = clamp(p.Pitch, -1, 1)
 	p.Timbre = clamp(p.Timbre, -1, 1)
 	p.Strength = clamp(p.Strength, 0, 1)
 	p.Gain = clamp(p.Gain, 0, 2)
+	p.PitchRange = clamp(p.PitchRange, 0, 1.5)
+	p.TargetF0 = clamp(p.TargetF0, 0, 500)
+	if p.TargetF0 > 0 && p.TargetF0 < 70 {
+		p.TargetF0 = 70
+	}
+	p.FormantShape = clamp(p.FormantShape, -1, 1)
+	return p
+}
+
+func (e *Engine) setParamsLocked(p Params) {
+	p = p.normalized()
 	r := math.Pow(2, p.Pitch)
 	w := math.Pow(2, p.Timbre)
 	e.pre.SetGains(p.EqPre, e.sr)
 	e.post.SetGains(p.EqPost, e.sr)
-	if r != e.pitchR || w != e.timbreW || p.Strength != e.strength {
+	if r != e.pitchR || w != e.timbreW || p.Strength != e.strength ||
+		p.Speech != e.params.Speech ||
+		p.PitchRange != e.params.PitchRange ||
+		p.TargetF0 != e.params.TargetF0 ||
+		p.FormantShape != e.params.FormantShape {
 		// EQ and gain ride along without a rebuild; a morph change
 		// swaps in a fresh chain and fades the previous side out.
-		nc := e.newChainLocked(r, w, p.Strength)
+		nc := e.newChainLocked(p)
 		if e.cur != nil {
 			if e.prev == nil {
 				e.prev = e.cur
@@ -180,7 +225,7 @@ func (e *Engine) setParamsLocked(p Params) {
 		// instead of superposing two copies |off| apart.
 		off := 0
 		if nc != nil {
-			off = morphOffset(r)
+			off = nc.Offset()
 		}
 		e.cur = &side{chain: nc, pos: e.inPos - off}
 		if nc != nil && len(e.dryQ) > 0 {
@@ -209,21 +254,28 @@ func (e *Engine) setParamsLocked(p Params) {
 	e.params = p
 }
 
-// newChainLocked builds the morph chain for r/w/strength, or nil when
-// the morph section is neutral. The user-facing timbre warp is
-// w^strength (strength scales the effect, not the correctness): the
-// formant stage is fed w^strength/r at full strength — resampling by r
-// scales formants by r too, so warping back by exactly 1/r leaves the
-// net formant shift at w^strength and pitch never drags timbre with it.
-func (e *Engine) newChainLocked(r, w, strength float64) *morphChain {
-	we := math.Pow(w, strength) // effective warp = 2^(timbre*strength)
+// newChainLocked selects the active analysis path. Legacy keeps the
+// resample+WSOLA+uniform-warp model; Speech uses a 1:1 PSOLA stage whose
+// pitch and formant changes leave fricative/noise content on the dry
+// timeline. The neutral case is still the transparent nil chain.
+func (e *Engine) newChainLocked(p Params) morphChain {
+	if p.Speech {
+		c := NewSpeechChain(p, e.sr)
+		if c.Transparent() {
+			return nil
+		}
+		return c
+	}
+	r := math.Pow(2, p.Pitch)
+	we := math.Pow(2, p.Timbre*p.Strength)
 	if r == 1 && we == 1 {
 		return nil
 	}
-	return &morphChain{
+	return &legacyChain{
 		res:  NewResampler(1 / r),                      // shrink duration by r
 		wso:  NewWSOLA(1/r, 2048, 512, 256, int(e.sr)), // stretch back by r
-		form: NewFormant(we/r, 1, int(e.sr)),           // pitch compensation at full strength
+		form: NewFormant(we/r, 1, int(e.sr)),           // pitch compensation
+		off:  morphOffset(r),
 	}
 }
 
@@ -248,10 +300,10 @@ func (e *Engine) rebuildLocked() {
 	r := math.Pow(2, e.params.Pitch)
 	w := math.Pow(2, e.params.Timbre)
 	e.inPos, e.outPos = 0, 0
-	nc := e.newChainLocked(r, w, e.params.Strength)
+	nc := e.newChainLocked(e.params)
 	off := 0
 	if nc != nil {
-		off = morphOffset(r)
+		off = nc.Offset()
 	}
 	e.cur = &side{chain: nc, pos: -off}
 	e.prev = nil
@@ -518,10 +570,10 @@ func (e *Engine) Flush() []float32 {
 	var out []float64
 	if !e.params.Bypass {
 		if e.prev != nil && e.prev.chain != nil {
-			e.prev.q = append(e.prev.q, e.prev.chain.flush()...)
+			e.prev.q = append(e.prev.q, e.prev.chain.Flush()...)
 		}
 		if e.cur.chain != nil {
-			e.cur.q = append(e.cur.q, e.cur.chain.flush()...)
+			e.cur.q = append(e.cur.q, e.cur.chain.Flush()...)
 		}
 		// at flush there is no next block to wait on: exhaust the
 		// stall budget so the emit cap falls back to arrival pairing
@@ -672,7 +724,10 @@ func (e *Engine) Render(in []float32) []float32 {
 	defer e.mu.Unlock()
 	out := make([]float32, len(in))
 	if !e.params.Bypass {
-		prior := morphOffset(e.pitchR)
+		prior := 0
+		if e.cur.chain != nil {
+			prior = e.cur.chain.Offset()
+		}
 		pad := renderPad(prior)
 		x := make([]float64, len(in)+pad)
 		for i, v := range in {
@@ -684,7 +739,7 @@ func (e *Engine) Render(in []float32) []float32 {
 		e.fade = morphFadeLen
 		e.cur.push(x)
 		if e.cur.chain != nil {
-			e.cur.q = append(e.cur.q, e.cur.chain.flush()...)
+			e.cur.q = append(e.cur.q, e.cur.chain.Flush()...)
 		}
 		mix := e.drainMorph()
 		mix = e.post.Process(mix)
@@ -697,8 +752,8 @@ func (e *Engine) Render(in []float32) []float32 {
 			// the true input→output offset is signal- and
 			// position-dependent: measure it by cross-correlating the
 			// input's and the pipeline output's energy envelopes,
-			// constrained to a window around the fitted constant
-			off = alignLag(x, mix, morphOffset(e.pitchR))
+			// constrained to a window around the chain's declared prior
+			off = alignLag(x, mix, e.cur.chain.Offset())
 		}
 		for i := range out {
 			if j := i + pad + off; j >= 0 && j < len(mix) {

@@ -247,6 +247,54 @@ html, body {
 }
 
 /* faders */
+.speech-mode {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  margin-bottom: 18px;
+  padding: 10px 12px;
+  border: 1px solid var(--line-2);
+  border-radius: 9px;
+  background: #fbfaf6;
+}
+.speech-mode label { font-size: 12.5px; font-weight: 600; cursor: pointer; }
+.speech-mode p { margin: 3px 0 0; color: var(--ink-2); font-size: 10.5px; }
+.speech-mode input {
+  appearance: none;
+  flex: none;
+  width: 34px;
+  height: 20px;
+  margin: 0;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--line-2);
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+.speech-mode input::before {
+  content: "";
+  display: block;
+  width: 14px;
+  height: 14px;
+  margin: 2px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: var(--shadow);
+  transition: transform 0.15s;
+}
+.speech-mode input:checked { background: var(--accent); border-color: var(--accent); }
+.speech-mode input:checked::before { transform: translateX(14px); }
+.speech-mode input:focus-visible { outline: 2px solid var(--accent-deep); outline-offset: 3px; }
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
 .faders {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
@@ -254,7 +302,18 @@ html, body {
   flex: 1;
   align-items: center;
 }
-.fader-top { display: flex; align-items: baseline; justify-content: space-between; }
+.speech-controls {
+  min-width: 0;
+  margin: 18px 0 0;
+  padding: 18px 0 0;
+  border: 0;
+  border-top: 1px solid var(--line-2);
+  align-items: start;
+}
+.speech-controls:disabled { opacity: 0.5; }
+.speech-controls:disabled input { cursor: not-allowed; }
+.fader { min-width: 0; }
+.fader-top { display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: 4px 8px; }
 .fader-top label { font-size: 13px; font-weight: 600; }
 .fader-top label em { font-style: normal; color: var(--ink-3); font-weight: 400; font-size: 11px; margin-left: 4px; }
 .fader-top output {

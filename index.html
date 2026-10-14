@@ -72,6 +72,13 @@
               <h3>调参面板</h3>
               <button id="reset" class="btn ghost sm">重置</button>
             </div>
+            <div class="speech-mode">
+              <div>
+                <label for="speech">语音模式</label>
+                <p id="speech-note">适合说话，可调语调与音高中心。</p>
+              </div>
+              <input type="checkbox" id="speech" role="switch" aria-controls="speech-controls" aria-describedby="speech-note" />
+            </div>
             <div class="faders">
               <div class="fader">
                 <div class="fader-top">
@@ -98,9 +105,39 @@
                 </div>
                 <input type="range" id="strength" min="0" max="100" step="1" value="100" />
                 <div class="fader-scale"><span>0%</span><span></span><span>100%</span></div>
-                <p class="fader-note">音色干湿比</p>
+                <p class="fader-note">音色偏移强度（非干湿比）</p>
               </div>
             </div>
+            <fieldset id="speech-controls" class="faders speech-controls" disabled aria-describedby="speech-note">
+              <legend class="sr-only">语音模式调节</legend>
+              <div class="fader">
+                <div class="fader-top">
+                  <label for="pitch-range">语调幅度</label>
+                  <output id="pitch-range-val">1.00×</output>
+                </div>
+                <input type="range" id="pitch-range" min="0" max="1.5" step="0.01" value="1" aria-describedby="pitch-range-note" />
+                <div class="fader-scale"><span>平稳</span><span>自然</span><span>丰富</span></div>
+                <p id="pitch-range-note" class="fader-note">控制说话时的音高起伏</p>
+              </div>
+              <div class="fader">
+                <div class="fader-top">
+                  <label for="target-f0">目标音高中心 <em>Hz</em></label>
+                  <output id="target-f0-val">自动</output>
+                </div>
+                <input type="range" id="target-f0" min="0" max="500" step="10" value="0" aria-describedby="target-f0-note" />
+                <div class="fader-scale"><span>自动</span><span>70–500 Hz</span></div>
+                <p id="target-f0-note" class="fader-note">自动跟随原声音高中心；设置后仍叠加音高调节</p>
+              </div>
+              <div class="fader">
+                <div class="fader-top">
+                  <label for="formant-shape">共振峰形状</label>
+                  <output id="formant-shape-val">+0.00</output>
+                </div>
+                <input type="range" id="formant-shape" min="-1" max="1" step="0.01" value="0" aria-describedby="formant-shape-note" />
+                <div class="fader-scale"><span>厚实</span><span>自然</span><span>明亮</span></div>
+                <p id="formant-shape-note" class="fader-note">调整音色的厚实与明亮感</p>
+              </div>
+            </fieldset>
           </div>
 
           <!-- EQ -->
