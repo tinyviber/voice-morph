@@ -175,6 +175,76 @@ func containsFile(t *testing.T, p string) bool {
 	return err == nil
 }
 
+// Undisposed unmatched audio must appear in skipped and downgrade the
+// manifest — silence about real audio is the exact hole a downstream
+// agent falls into. An explicit discard records the verdict without
+// downgrading.
+func TestRender_UndisposedUnmatchedBlocksComplete(t *testing.T) {
+	dir := t.TempDir()
+	src := synthSpeech(4000, [][2]int{{500, 1500}, {2500, 3500}})
+	audioPath := filepath.Join(dir, "take.wav")
+	writeWAV(t, audioPath, src)
+	sha, _ := SHA256File(audioPath)
+	mk := func(discard bool) *Timeline {
+		return &Timeline{
+			Version: SchemaVersion, Audio: audioPath, AudioSHA256: sha,
+			SampleRate: engine.SampleRate, DurationMs: 4000,
+			Segments: []TimelineSegment{
+				{SegmentID: "seg-0001", LineID: "l01", RoleID: "narrator", SpokenText: "你好",
+					ASRRaw: "你好", StartMs: 500, EndMs: 1500, MatchStatus: MatchExact, Selected: true},
+				{SegmentID: "seg-0002", ASRRaw: "临时插一句", SpokenText: "临时插一句",
+					StartMs: 2500, EndMs: 3500, MatchStatus: MatchUnmatched,
+					Discarded: discard, ReviewRequired: !discard,
+					ReviewReasons: []string{ReviewUnmatchedAudio}},
+			},
+		}
+	}
+	tlPath := filepath.Join(dir, "timeline.json")
+	voicesPath := filepath.Join(dir, "voices.json")
+	os.WriteFile(voicesPath, []byte(`{"version":1,"voices":{"narrator":{"backend":"dsp","preset":"normal"}}}`), 0o644)
+	if err := SaveJSON(tlPath, mk(false)); err != nil {
+		t.Fatal(err)
+	}
+	m, err := Render(RenderOptions{TimelinePath: tlPath, VoicesPath: voicesPath, OutDir: filepath.Join(dir, "out")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Status == "complete" {
+		t.Fatal("undisposed unmatched audio must not yield complete")
+	}
+	found := false
+	for _, s := range m.Skipped {
+		if s.ID == "seg-0002" && s.Reason == "unmatched audio awaiting disposition" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("unmatched audio must be recorded in skipped: %+v", m.Skipped)
+	}
+	if m.Counts["undisposed_audio"] != 1 {
+		t.Fatalf("counts must surface the undisposed audio: %+v", m.Counts)
+	}
+	if err := SaveJSON(tlPath, mk(true)); err != nil {
+		t.Fatal(err)
+	}
+	m, err = Render(RenderOptions{TimelinePath: tlPath, VoicesPath: voicesPath, OutDir: filepath.Join(dir, "out2")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Status != "complete" {
+		t.Fatalf("explicit discard must clear the path to complete, got %s", m.Status)
+	}
+	found = false
+	for _, s := range m.Skipped {
+		if s.ID == "seg-0002" && s.Reason == "discarded by reviewer" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("discard verdict must be recorded: %+v", m.Skipped)
+	}
+}
+
 func TestRender_UnmatchedKeepsRaw(t *testing.T) {
 	dir := t.TempDir()
 	src := synthSpeech(4000, [][2]int{{500, 1500}, {2500, 3500}})

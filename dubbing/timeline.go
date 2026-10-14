@@ -84,6 +84,10 @@ type TimelineSegment struct {
 	// ReviewRequired — only the confirm action (or a manual bind) sets
 	// it; merely editing text never counts as review.
 	Reviewed bool `json:"reviewed,omitempty"`
+	// Discarded marks audio a human explicitly decided not to ship
+	// (a cough, a stray "对了" aside). Undisposed unmatched audio
+	// downgrades the manifest — discarded is the recorded alternative.
+	Discarded bool `json:"discarded,omitempty"`
 }
 
 // UnmatchedLine is a script line with no detected audio.

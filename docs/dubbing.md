@@ -58,9 +58,11 @@ VoiceMorph 的第二个工作区：**录音是事实来源，台本只是参考*
    语句级段：切点是句末标点，其次词级时间戳上 ≥600ms 的停顿
    （ASR 可能整段不给标点）；词 ts 派生的边界不标估计，按比例
    推算的内部切点一律标 `coarse`（父段的真实外边界不外推）。
-   既无标点又无词 ts 的「不可切段」不硬切——块匹配对其放宽行数
-   上限（≤64 行），产物全部 `estimated_boundary`+待审核并在
-   `timeline.warnings` 记降级说明，而不是误报大片 `no_audio`。
+   切不掉的「大段」（残留 norm 长度 > MaxLinesPerBlock×8）不硬切——
+   降级条件看**残留大小**不看缺什么特征：块匹配对其放宽行数
+   （约 len/3，≤64 行）。有词 ts 时内部切点由台本对齐映射到词
+   边界（measured）；无词 ts 则全部 `estimated_boundary`；两者
+   都在 `timeline.warnings` 记降级说明，绝不误报大片 `no_audio`。
    外部 asr-raw 也走同一入口。
 1. **归一化**：去标点空白、全角折半角、小写；保留原文字符索引映射，
    使切回原文取 `spoken_text` 时每个真实字符都能还原。
@@ -99,9 +101,15 @@ VoiceMorph 的第二个工作区：**录音是事实来源，台本只是参考*
    `manifest.status`：`complete`/`blocked_review`/`partial`/`failed`——
    整句漏读（`unmatched_lines` 非空）报 `partial`，仅当人工在
    timeline 将该行标 `optional:true` 才豁免；`partial` 优先级高于
-   `blocked_review`（缺失音频靠审核补不回来）。`manifest.counts`
-   给出结构化原因计数（rendered/failures/blocked_review/
-   missing_lines/unselected_takes），agent 无需解析 skipped 文案。
+   `blocked_review`（缺失音频靠审核补不回来）。**未匹配音频必须
+   有处置**：unmatched 段一律进 `manifest.skipped`，未处置 →
+   `blocked_review`（counts.undisposed_audio）；三种处置——绑到
+   漏读行（同步修复 line_id/script_text/unmatched_lines，按
+   asr_ref 跨校对保留）、配角色保留为即兴（`manual`）、显式丢弃
+   （`discarded:true`，记 `discarded by reviewer` 不降级）。
+   `manifest.counts` 给出结构化原因计数（rendered/failures/
+   blocked_review/missing_lines/unselected_takes/undisposed_audio/
+   discarded），agent 无需解析 skipped 文案。
 
 ## C. 渲染（render）
 

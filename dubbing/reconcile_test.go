@@ -583,3 +583,52 @@ func TestReconcile_FusedBoundless(t *testing.T) {
 		t.Fatal("boundless pieces must carry estimated_boundary")
 	}
 }
+
+// Fast continuous read: word ts exist but every inter-sentence pause
+// is 250ms — below PauseGapMs. The splitter can't cut; the matcher
+// must degrade on residual size (not on missing words) and bind all
+// 60 lines with word-mapped boundaries instead of reporting no_audio.
+func TestReconcile_FusedShortPauses(t *testing.T) {
+	const nLines = 60
+	var lines []ScriptLine
+	var full strings.Builder
+	var words []ASRWord
+	pos := 0
+	for i := 0; i < nLines; i++ {
+		text := fmt.Sprintf("这是第%d句对白内容", i)
+		lines = append(lines, ScriptLine{LineID: fmt.Sprintf("l%02d", i+1),
+			SceneID: "s1", RoleID: "narrator", Text: text})
+		runes := []rune(text)
+		for j, r := range runes {
+			words = append(words, ASRWord{Text: string(r),
+				StartMs: pos + j*350, EndMs: pos + j*350 + 330})
+		}
+		full.WriteString(text)
+		pos = pos + len(runes)*350 + 250 // fast read: 250ms < PauseGapMs
+	}
+	doc := &ASRDoc{Version: 1, Audio: "long.wav", SampleRate: 48000,
+		DurationMs: pos,
+		Segments: []ASRSegment{{SegmentID: "fused-1", StartMs: 0,
+			EndMs: pos, Text: full.String(), Words: words, Coarse: true}}}
+	spl := SplitFusedSegments(doc.Segments)
+	if len(spl) != 1 {
+		t.Fatalf("short pauses must not split, got %d", len(spl))
+	}
+	tl, err := Reconcile(&Script{Version: 1, Lines: lines}, doc, DefaultReconcileOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	bound := map[string]bool{}
+	for _, s := range tl.Segments {
+		if s.LineID != "" && s.Selected {
+			bound[s.LineID] = true
+		}
+	}
+	if len(bound) != nLines || len(tl.UnmatchedLines) != 0 {
+		t.Fatalf("fast-read fused seg dropped lines: bound %d/%d unmatched=%d",
+			len(bound), nLines, len(tl.UnmatchedLines))
+	}
+	if len(tl.Warnings) == 0 {
+		t.Fatal("degraded oversized seg must warn on the timeline")
+	}
+}

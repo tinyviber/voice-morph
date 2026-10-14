@@ -183,20 +183,28 @@ func Reconcile(script *Script, asr *ASRDoc, opts ReconcileOptions) (*Timeline, e
 // alignBlocks finds the minimum-cost partition of lines×segs into
 // matched/skipped blocks. Costs: match = (1-sim)+MergePenalty*(di-1+dk-1),
 // skipped line = SkipLineCost, skipped segment = SkipSegCost.
-// boundless reports whether a segment cannot be split into sentences:
-// no word timestamps AND no terminal punctuation. A boundless fused
-// segment is allowed to host more than MaxLinesPerBlock lines —
-// otherwise every extra line would be falsely reported as unread.
-func boundless(s normSeg) bool {
-	if len(s.seg.Words) > 0 {
-		return false
+// oversized reports a segment still holding more text than one block
+// can bind — the splitter already failed to cut it (no punctuation,
+// inter-sentence pauses below the threshold, or no word ts at all).
+// The criterion is the RESIDUAL SIZE, not which features are missing,
+// so a fast read with 250ms gaps degrades the same way a wordless
+// blob does: the block matcher relaxes the line cap instead of
+// reporting mass no_audio.
+func oversized(s normSeg, opts ReconcileOptions) bool {
+	return len(s.norm) > opts.MaxLinesPerBlock*8
+}
+
+// oversizedDiCap bounds how many lines one oversized segment may
+// host: ~3 normalized chars per line minimum, hard-capped.
+func oversizedDiCap(s normSeg, opts ReconcileOptions) int {
+	cap := len(s.norm) / 3
+	if cap < opts.MaxLinesPerBlock {
+		return opts.MaxLinesPerBlock
 	}
-	for _, r := range s.seg.Text {
-		if sentEndRunes[r] {
-			return false
-		}
+	if cap > 64 {
+		return 64
 	}
-	return true
+	return cap
 }
 
 func alignBlocks(lines []normLine, segs []normSeg, opts ReconcileOptions) []block {
@@ -234,8 +242,8 @@ func alignBlocks(lines []normLine, segs []normSeg, opts ReconcileOptions) []bloc
 			// match blocks
 			for dk := 1; dk <= opts.MaxSegsPerBlock && k+dk <= m; dk++ {
 				diCap := opts.MaxLinesPerBlock
-				if dk == 1 && boundless(segs[k]) {
-					diCap = 64 // unsplittable fused seg: degrade, don't drop
+				if dk == 1 && oversized(segs[k], opts) {
+					diCap = oversizedDiCap(segs[k], opts)
 				}
 				for di := 1; di <= diCap && i+di <= n; di++ {
 					nc := c + matchCost(i, di, k, dk)
@@ -429,7 +437,14 @@ func emitBlock(t *Timeline, bl []normLine, bs []normSeg, i0, k0 int,
 	opts ReconcileOptions, unmatched *[]int, segEmitted []bool, lineBound []bool) {
 
 	for _, s := range bs {
-		if boundless(s) {
+		if !oversized(s, opts) {
+			continue
+		}
+		if len(s.seg.Words) > 0 {
+			t.Warnings = append(t.Warnings, fmt.Sprintf(
+				"%s: 融合段无法自动分句（停顿过短/无标点），内部切点由台本对齐映射到词边界",
+				s.seg.SegmentID))
+		} else {
 			t.Warnings = append(t.Warnings, fmt.Sprintf(
 				"%s: 融合段无标点/词时间戳不可切分，按字符对齐降级——内部边界全为估计",
 				s.seg.SegmentID))

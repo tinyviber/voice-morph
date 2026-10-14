@@ -23,6 +23,7 @@ interface TimelineSeg {
   boundary?: string;
   edited?: boolean;
   reviewed?: boolean;
+  discarded?: boolean;
 }
 interface Timeline {
   version: number;
@@ -33,7 +34,7 @@ interface Timeline {
   script?: string;
   asr_file?: string;
   segments: TimelineSeg[];
-  unmatched_lines?: { line_id: string; role_id: string; text: string; reason: string }[];
+  unmatched_lines?: { line_id: string; role_id: string; text: string; reason: string; optional?: boolean }[];
   review_count: number;
 }
 
@@ -140,11 +141,15 @@ function renderTable() {
     body.innerHTML = `<tr><td colspan="9" class="empty">还没有校对结果 — 选音频+台本后点「转写+校对」</td></tr>`;
     return;
   }
+  const unLines = tl.unmatched_lines ?? [];
   body.innerHTML = tl.segments.map((s, i) => {
     const status = STATUS_ZH[s.match_status] ?? s.match_status;
     const reasons = (s.review_reasons ?? []).map((r) => REASON_ZH[r] ?? r).join("、");
     const cls = s.review_required ? "flag" : "";
     const take = s.take_index ? `take ${s.take_index}` : "";
+    const disposition = s.match_status === "unmatched"
+      ? ` <select class="bind-line" data-i="${i}" title="把这段音频绑到一句漏读台词"><option value="">绑到台词…</option>${unLines.map((l) => `<option value="${esc(l.line_id)}">${esc(l.line_id)} ${esc(l.text.slice(0, 12))}</option>`).join("")}</select> <button class="btn mini discard-seg" data-i="${i}" title="明确丢弃此音频">${s.discarded ? "已丢弃" : "丢弃"}</button>`
+      : "";
     return `<tr class="${cls}" data-i="${i}">
       <td class="mono">${i + 1}</td>
       <td><button class="btn mini play" data-i="${i}" title="试听原片段">▶</button></td>
@@ -153,12 +158,16 @@ function renderTable() {
       <td><input class="spoken" data-i="${i}" value="${esc(s.spoken_text)}"></td>
       <td><select class="role" data-i="${i}"><option value="">（未分配）</option>${roleOptions(s.role_id ?? "")}</select></td>
       <td>${status} ${take} <span class="sim">${s.similarity.toFixed(2)}</span></td>
-      <td class="reasons">${esc(reasons)}${s.review_required ? ` <button class="btn mini ok-seg" data-i="${i}" title="确认此片段已审核无误">确认</button>` : ""}</td>
+      <td class="reasons">${esc(reasons)}${s.review_required ? ` <button class="btn mini ok-seg" data-i="${i}" title="确认此片段已审核无误">确认</button>` : ""}${disposition}</td>
       <td><input type="checkbox" class="sel" data-i="${i}"${s.selected ? " checked" : ""}></td>
     </tr>`;
   }).join("");
-  $("#dub-review-count").textContent = tl.review_count > 0
-    ? `${tl.review_count} 段待审核` : "全部就绪";
+  // Recount locally every render — confirm/discard/bind change the
+  // count, tl.review_count is only the value from the last reconcile.
+  const pending = tl.segments.filter((s) =>
+    s.review_required || (s.match_status === "unmatched" && !s.discarded)).length;
+  $("#dub-review-count").textContent = pending > 0
+    ? `${pending} 段待审核` : "全部就绪";
   $("#dub-unmatched").textContent = (tl.unmatched_lines?.length ?? 0) > 0
     ? `${tl.unmatched_lines!.length} 句台本无音频（漏读）` : "";
   body.querySelectorAll<HTMLElement>(".play").forEach((b) =>
@@ -188,6 +197,41 @@ function renderTable() {
       if (el.value) {
         s.review_reasons = (s.review_reasons ?? []).filter((r) => r !== "needs_role");
         if (!s.review_reasons.length && s.reviewed) s.review_required = false;
+      }
+      renderTable();
+    }));
+  body.querySelectorAll<HTMLSelectElement>(".bind-line").forEach((el) =>
+    el.addEventListener("change", () => {
+      const s = tl!.segments[+el.dataset.i!]!;
+      const lid = el.value;
+      if (!lid) return;
+      const line = (tl!.unmatched_lines ?? []).find((l) => l.line_id === lid);
+      if (!line) return;
+      // Bind this audio span to the missing line: it renders under the
+      // line's role and the line leaves the unmatched_lines list.
+      s.line_id = line.line_id;
+      s.script_text = line.text;
+      s.role_id = line.role_id;
+      s.match_status = "manual";
+      s.selected = true;
+      s.edited = true;
+      s.reviewed = true; // the bind IS the human disposition
+      s.review_required = false;
+      s.review_reasons = [];
+      s.discarded = false;
+      tl!.unmatched_lines = (tl!.unmatched_lines ?? []).filter((l) => l.line_id !== lid);
+      renderTable();
+    }));
+  body.querySelectorAll<HTMLElement>(".discard-seg").forEach((el) =>
+    el.addEventListener("click", () => {
+      const s = tl!.segments[+el.dataset.i!]!;
+      s.discarded = !s.discarded;
+      s.edited = true;
+      // A deliberate discard is a disposition — discharge the review item.
+      if (s.discarded) {
+        s.reviewed = true;
+        s.review_required = false;
+        s.review_reasons = [];
       }
       renderTable();
     }));
@@ -267,7 +311,12 @@ export function initDubbing() {
       tl = await call(Dubber.loadTimelineFile(p));
       tlPath = p;
       audioPath = tl!.audio;
+      audioBufs.delete(audioPath);
       $("#dub-audio").textContent = audioPath;
+      // Reopen the session this timeline belongs to — rendering into a
+      // stale or empty outDir was a real footgun.
+      outDir = p.replace(/[\\/][^\\/]+$/, "");
+      $("#dub-out").textContent = outDir;
       renderTable();
     } catch (e) { toast((e as Error).message, true); }
   });

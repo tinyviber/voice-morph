@@ -195,7 +195,21 @@ func Render(opts RenderOptions) (*Manifest, error) {
 		jobs = append(jobs, job{seg: s, params: p, exp: voices.Experimental(s.RoleID)})
 	}
 	for _, s := range tl.Segments {
-		if !s.Selected && s.MatchStatus != MatchUnmatched {
+		switch {
+		case s.MatchStatus == MatchUnmatched && s.Discarded:
+			// Human explicitly decided not to ship this audio: recorded,
+			// no downgrade.
+			m.Skipped = append(m.Skipped, ManifestSkip{ID: s.SegmentID,
+				Reason: "discarded by reviewer"})
+		case s.MatchStatus == MatchUnmatched:
+			// Every span of real audio must have a disposition — an
+			// undisposed unmatched segment can't leave the manifest and
+			// the job can't claim complete; it needs a human verdict
+			// (bind / improvise / discard).
+			m.Skipped = append(m.Skipped, ManifestSkip{ID: s.SegmentID,
+				Reason: "unmatched audio awaiting disposition"})
+			blockedReview = true
+		case !s.Selected:
 			m.Skipped = append(m.Skipped, ManifestSkip{ID: s.SegmentID, Reason: "take not selected"})
 		}
 	}
@@ -397,6 +411,7 @@ func Render(opts RenderOptions) (*Manifest, error) {
 	m.Counts = map[string]int{
 		"rendered": len(m.Lines), "failures": len(m.Failures),
 		"blocked_review": 0, "missing_lines": 0, "unselected_takes": 0,
+		"undisposed_audio": 0, "discarded": 0,
 	}
 	for _, s := range m.Skipped {
 		switch {
@@ -406,6 +421,10 @@ func Render(opts RenderOptions) (*Manifest, error) {
 			m.Counts["missing_lines"]++
 		case s.Reason == "take not selected":
 			m.Counts["unselected_takes"]++
+		case s.Reason == "unmatched audio awaiting disposition":
+			m.Counts["undisposed_audio"]++
+		case s.Reason == "discarded by reviewer":
+			m.Counts["discarded"]++
 		}
 	}
 	if m.Status != "failed" {

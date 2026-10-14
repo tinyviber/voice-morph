@@ -69,7 +69,13 @@ manifest。
 `partial`=有缺失——整句漏读（`unmatched_lines` 未标 `optional:true`）
 或其他选中行未渲染，**优先级高于 blocked_review**（审核补不回没录的音）；
 `failed`=有渲染失败。`manifest.counts` 给结构化计数
-（rendered/failures/blocked_review/missing_lines/unselected_takes）。
+（rendered/failures/blocked_review/missing_lines/unselected_takes/
+undisposed_audio/discarded）。
+未匹配音频必须有处置：未处置的 unmatched 段进 `skipped`（原因
+`unmatched audio awaiting disposition`）且状态降级——它在 manifest
+里不可见 = 录音被静默漏掉。三种处置：绑到漏读行（同步消除该行的
+unmatched_lines 记录）、配角色保留为即兴对白、显式丢弃
+（`discarded:true` → `discarded by reviewer`，不降级）。
 CLI `ok` 与退出码跟着 status 走（complete→true/0，其余→false/1）。
 台本行确属有意不录时，在 timeline-reviewed.json 的 `unmatched_lines`
 里给该行加 `optional:true`——渲染不再降级，skipped 仍如实记录。
