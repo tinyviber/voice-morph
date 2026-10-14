@@ -119,6 +119,22 @@ func Reconcile(script *Script, asr *ASRDoc, opts ReconcileOptions) (*Timeline, e
 		n, src := normRunes(s.Text)
 		segs[k] = normSeg{seg: s, norm: n, src: src, rs: []rune(s.Text)}
 	}
+	// Residual oversized segments (no punctuation, short pauses, or no
+	// word ts at all) get a second, script-driven cut: each successive
+	// line's leading normalized runes are searched IN ORDER inside the
+	// segment's remaining text; hits become cut points. This is the
+	// layered fallback the matcher needs for >64-line fused input —
+	// raising the DP cap blindly would just be slower, not safer.
+	var anchored []normSeg
+	anchorWarn := map[string]int{}
+	for _, s := range segs {
+		pieces, nAnchors := anchorSplit(s, lines, opts)
+		if nAnchors > 0 {
+			anchorWarn[s.seg.SegmentID] = nAnchors
+		}
+		anchored = append(anchored, pieces...)
+	}
+	segs = anchored
 
 	blocks := alignBlocks(lines, segs, opts)
 
@@ -128,6 +144,10 @@ func Reconcile(script *Script, asr *ASRDoc, opts ReconcileOptions) (*Timeline, e
 		AudioSHA256: asr.AudioSHA256,
 		SampleRate: asr.SampleRate,
 		DurationMs: asr.DurationMs,
+	}
+	for id, n := range anchorWarn {
+		t.Warnings = append(t.Warnings, fmt.Sprintf(
+			"%s: 融合段按台本锚点预切为 %d 块（切点由文本对齐推导，边界为估计）", id, n))
 	}
 	var unmatchedSegIdx []int
 	segEmitted := make([]bool, len(segs))
@@ -205,6 +225,105 @@ func oversizedDiCap(s normSeg, opts ReconcileOptions) int {
 		return 64
 	}
 	return cap
+}
+
+// anchorSplit cuts a still-oversized segment at script-derived text
+// anchors: each successive line's leading normalized runes are
+// searched IN ORDER in the segment's remaining norm text; a hit marks
+// a cut point between pieces. Lines whose seed isn't found share a
+// piece with their neighbors — nothing is fabricated. Cut positions
+// snap to word edges when timestamps exist (still coarse: the
+// SELECTION was inferred), else stay proportional. Returns the pieces
+// and the number of applied cut points (0 = unchanged).
+func anchorSplit(s normSeg, lines []normLine, opts ReconcileOptions) ([]normSeg, int) {
+	if !oversized(s, opts) {
+		return []normSeg{s}, 0
+	}
+	anchors := []int{0}
+	cursor := 0
+	for _, l := range lines {
+		seedLen := minInt(6, len(l.norm))
+		if seedLen < 3 {
+			continue
+		}
+		idx := indexFrom(s.norm, l.norm[:seedLen], cursor)
+		if idx > cursor {
+			anchors = append(anchors, idx)
+			cursor = idx
+		}
+	}
+	if len(anchors) < 3 {
+		return []normSeg{s}, 0
+	}
+	anchors = append(anchors, len(s.norm))
+	pieces := make([]normSeg, 0, len(anchors)-1)
+	span := s.seg.EndMs - s.seg.StartMs
+	for i := 0; i+1 < len(anchors); i++ {
+		a, b := anchors[i], anchors[i+1]
+		sub := s
+		sub.seg.SegmentID = fmt.Sprintf("%s.a%d", s.seg.SegmentID, i+1)
+		// Slice raw text via the norm→source-rune map so punctuation
+		// normalization can't corrupt the piece text.
+		from, to := s.src[a], s.src[b-1]+1
+		sub.seg.Text = string(s.rs[from:to])
+		lo := s.seg.StartMs + a*span/len(s.norm)
+		hi := s.seg.StartMs + b*span/len(s.norm)
+		if len(s.seg.Words) > 0 {
+			// Snap each cut to the nearest word edge — real timestamp,
+			// inferred position.
+			lo = snapWordEdge(s.seg.Words, lo)
+			hi = snapWordEdge(s.seg.Words, hi)
+		}
+		if hi <= lo {
+			hi = lo + 1
+		}
+		sub.seg.StartMs, sub.seg.EndMs = lo, hi
+		sub.seg.Coarse = true // anchor-derived cut is always an estimate
+		var words []ASRWord
+		for _, w := range s.seg.Words {
+			if w.EndMs > lo && w.StartMs < hi {
+				words = append(words, w)
+			}
+		}
+		sub.seg.Words = words
+		n, src := normRunes(sub.seg.Text)
+		sub.norm, sub.src, sub.rs = n, src, []rune(sub.seg.Text)
+		pieces = append(pieces, sub)
+	}
+	return pieces, len(anchors) - 2
+}
+
+// indexFrom finds needle in hay starting at from; -1 when absent.
+func indexFrom(hay, needle []rune, from int) int {
+	if len(needle) == 0 || from+len(needle) > len(hay) {
+		return -1
+	}
+	for i := from; i+len(needle) <= len(hay); i++ {
+		ok := true
+		for j := range needle {
+			if hay[i+j] != needle[j] {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return i
+		}
+	}
+	return -1
+}
+
+// snapWordEdge returns the word boundary (start or end) nearest ms.
+func snapWordEdge(words []ASRWord, ms int) int {
+	best, bd := ms, 1<<30
+	for _, w := range words {
+		for _, e := range []int{w.StartMs, w.EndMs} {
+			if d := absInt(e - ms); d < bd {
+				best, bd = e, d
+			}
+		}
+	}
+	return best
 }
 
 func alignBlocks(lines []normLine, segs []normSeg, opts ReconcileOptions) []block {

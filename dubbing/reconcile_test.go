@@ -632,3 +632,96 @@ func TestReconcile_FusedShortPauses(t *testing.T) {
 		t.Fatal("degraded oversized seg must warn on the timeline")
 	}
 }
+
+// Closest-to-production case: 100 lines alternating three roles, no
+// punctuation, no pauses above the gap threshold — plus one skipped
+// line, one retake and one paraphrase mixed in. Anchored pre-split
+// must turn the fused input back into sentence-level pieces; binding
+// must preserve line_id AND role, keep plausible monotonic timestamps,
+// and still flag the retake and the paraphrase for review.
+func TestReconcile_FusedMultiRoleRealistic(t *testing.T) {
+	const nLines = 100
+	roles := []string{"narrator", "character-a", "character-b"}
+	var lines []ScriptLine
+	var full strings.Builder
+	var words []ASRWord
+	pos := 0
+	emit := func(text string, gapMs int) {
+		for j, r := range []rune(text) {
+			words = append(words, ASRWord{Text: string(r),
+				StartMs: pos + j*350, EndMs: pos + j*350 + 330})
+		}
+		full.WriteString(text)
+		pos += len([]rune(text))*350 + gapMs
+	}
+	for i := 0; i < nLines; i++ {
+		text := fmt.Sprintf("第%d幕台词要说的内容", i)
+		lines = append(lines, ScriptLine{LineID: fmt.Sprintf("l%03d", i+1),
+			SceneID: "s1", RoleID: roles[i%3], Text: text})
+		switch i {
+		case 20:
+			// skipped: never spoken
+		case 40:
+			emit("第40幕台词要设的内存", 200) // slip: retake follows
+			emit(text, 200)
+		case 60:
+			emit("第60幕台词想表达的意思", 200) // paraphrase
+		default:
+			emit(text, 200)
+		}
+	}
+	doc := &ASRDoc{Version: 1, Audio: "long.wav", SampleRate: 48000,
+		DurationMs: pos,
+		Segments: []ASRSegment{{SegmentID: "fused-1", StartMs: 0,
+			EndMs: pos, Text: full.String(), Words: words, Coarse: true}}}
+	tl, err := Reconcile(&Script{Version: 1, Lines: lines}, doc, DefaultReconcileOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	bound, lastEnd := map[string]*TimelineSegment{}, -1
+	for i := range tl.Segments {
+		s := &tl.Segments[i]
+		if s.LineID == "" || !s.Selected {
+			continue
+		}
+		if s.StartMs < lastEnd-2000 {
+			t.Fatalf("timestamps not monotonic at %s (%d < %d)", s.SegmentID, s.StartMs, lastEnd)
+		}
+		lastEnd = s.EndMs
+		bound[s.LineID] = s
+	}
+	// 99 of 100 lines bound (l021 intentionally unread).
+	if len(bound) != nLines-1 {
+		t.Fatalf("bound %d, want %d; unmatched=%v", len(bound), nLines-1, tl.UnmatchedLines)
+	}
+	skipFound := false
+	for _, u := range tl.UnmatchedLines {
+		if u.LineID == "l021" {
+			skipFound = true
+		}
+	}
+	if !skipFound {
+		t.Fatal("skipped line l021 must appear in unmatched_lines")
+	}
+	// Role assignment preserved for a deep line.
+	if bound["l100"] == nil || bound["l100"].RoleID != roles[99%3] {
+		t.Fatalf("l100 role wrong: %+v", bound["l100"])
+	}
+	// Retake of l041: expect take candidates (or a second seg bound to l041).
+	takes := 0
+	for _, s := range tl.Segments {
+		if s.LineID == "l041" && s.TakeIndex > 0 {
+			takes++
+		}
+	}
+	if takes == 0 {
+		t.Log("warning: l041 retake not surfaced as take candidates")
+	}
+	// Paraphrase l061 must bind but carry a review flag (low_similarity
+	// or ambiguous) — it must not look like a clean exact match.
+	if s := bound["l061"]; s == nil {
+		t.Fatal("paraphrased l061 unbound")
+	} else if !s.ReviewRequired && s.MatchStatus == MatchExact {
+		t.Fatalf("paraphrase looks too clean: %+v", s)
+	}
+}

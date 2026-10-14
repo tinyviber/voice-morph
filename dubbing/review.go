@@ -3,6 +3,7 @@ package dubbing
 import (
 	"fmt"
 	"sort"
+	"strings"
 )
 
 // MergeReviewed folds human edits from a reviewed timeline back into a
@@ -67,23 +68,57 @@ func MergeReviewed(draft, reviewed *Timeline) (*Timeline, error) {
 		}
 		draft.Segments[i] = s
 	}
-	// Manual binds by asr_ref: a reviewer may bind an unmatched audio
-	// span to an existing line. The draft seg still has LineID="" so
-	// the (line,ref) key above can't see it — match on the ASR ref.
-	byRef := map[string]int{}
+	// Manual binds & discards by STABLE SEGMENT IDENTITY — several
+	// TimelineSegments can share one ASRSegmentID (a fused ASR span
+	// split into lines), so a bare asr→index map would graft the last
+	// row's verdict onto siblings. Primary key is segment_id; fallback
+	// resolves asr_ref candidates by time AND text anchor, and refuses
+	// ambiguous matches outright — a lost verdict stays review-pending,
+	// never misapplied.
+	bySegID := map[string]int{}
+	byRef := map[string][]int{}
 	for i := range reviewed.Segments {
+		bySegID[reviewed.Segments[i].SegmentID] = i
 		if reviewed.Segments[i].ASRSegmentID != "" {
-			byRef[reviewed.Segments[i].ASRSegmentID] = i
+			byRef[reviewed.Segments[i].ASRSegmentID] = append(
+				byRef[reviewed.Segments[i].ASRSegmentID], i)
 		}
+	}
+	resolveReviewed := func(s TimelineSegment) (int, bool) {
+		if j, ok := bySegID[s.SegmentID]; ok {
+			return j, true
+		}
+		var cand []int
+		sn := normText(s.SpokenText)
+		for _, j := range byRef[s.ASRSegmentID] {
+			r := reviewed.Segments[j]
+			if absInt(r.StartMs-s.StartMs) > 2000 {
+				continue
+			}
+			rn := normText(r.SpokenText)
+			if rn == "" || sn == "" || strings.HasPrefix(rn, sn) || strings.HasPrefix(sn, rn) {
+				cand = append(cand, j)
+			}
+		}
+		if len(cand) == 1 {
+			return cand[0], true
+		}
+		return 0, false
 	}
 	boundLines := map[string]bool{}
 	for i, s := range draft.Segments {
-		j, ok := byRef[s.ASRSegmentID]
-		if !ok || s.LineID != "" || s.ASRSegmentID == "" {
+		if s.LineID != "" || s.ASRSegmentID == "" {
+			continue
+		}
+		j, ok := resolveReviewed(s)
+		if !ok {
 			continue
 		}
 		src := reviewed.Segments[j]
 		if src.MatchStatus != MatchManual || src.LineID == "" {
+			if src.Discarded && src.MatchStatus == MatchUnmatched {
+				draft.Segments[i].Discarded = true
+			}
 			continue
 		}
 		s.LineID = src.LineID
@@ -101,15 +136,6 @@ func MergeReviewed(draft, reviewed *Timeline) (*Timeline, error) {
 		s.Discarded = src.Discarded
 		draft.Segments[i] = s
 		boundLines[s.LineID] = true
-	}
-	// Carry Discarded verdicts for still-unmatched segs too.
-	for i, s := range draft.Segments {
-		if s.MatchStatus != MatchUnmatched || s.ASRSegmentID == "" {
-			continue
-		}
-		if j, ok := byRef[s.ASRSegmentID]; ok && reviewed.Segments[j].Discarded {
-			draft.Segments[i].Discarded = true
-		}
 	}
 	// UnmatchedLines: a bound line is no longer missing; optional
 	// markers from the reviewed file survive the re-run.

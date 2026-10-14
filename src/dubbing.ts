@@ -168,8 +168,19 @@ function renderTable() {
     s.review_required || (s.match_status === "unmatched" && !s.discarded)).length;
   $("#dub-review-count").textContent = pending > 0
     ? `${pending} 段待审核` : "全部就绪";
-  $("#dub-unmatched").textContent = (tl.unmatched_lines?.length ?? 0) > 0
-    ? `${tl.unmatched_lines!.length} 句台本无音频（漏读）` : "";
+  // Unmatched script lines get a disposition list of their own: each
+  // stays "需要补录" (partial at render) until explicitly marked
+  // "允许省略" — closing the review loop without editing JSON.
+  const un = tl.unmatched_lines ?? [];
+  $("#dub-unmatched").innerHTML = un.length === 0 ? "" :
+    `${un.length} 句台本无音频：` + un.map((l, i) =>
+      `<button class="chip unl" data-i="${i}" title="点击切换处置">${esc(l.line_id)} ${l.optional ? "允许省略" : "需要补录"}</button>`).join(" ");
+  document.querySelectorAll<HTMLElement>("#dub-unmatched .unl").forEach((b) =>
+    b.addEventListener("click", () => {
+      const l = tl!.unmatched_lines![+b.dataset.i!]!;
+      l.optional = !l.optional;
+      renderTable();
+    }));
   body.querySelectorAll<HTMLElement>(".play").forEach((b) =>
     b.addEventListener("click", () => {
       const s = tl!.segments[+b.dataset.i!]!;
