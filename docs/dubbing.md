@@ -58,12 +58,14 @@ VoiceMorph 的第二个工作区：**录音是事实来源，台本只是参考*
    语句级段：切点是句末标点，其次词级时间戳上 ≥600ms 的停顿
    （ASR 可能整段不给标点）；词 ts 派生的边界不标估计，按比例
    推算的内部切点一律标 `coarse`（父段的真实外边界不外推）。
-   切不掉的「大段」（残留 norm 长度 > MaxLinesPerBlock×8）不硬切——
-   降级条件看**残留大小**不看缺什么特征：块匹配对其放宽行数
-   （约 len/3，≤64 行）。有词 ts 时内部切点由台本对齐映射到词
-   边界（measured）；无词 ts 则全部 `estimated_boundary`；两者
-   都在 `timeline.warnings` 记降级说明，绝不误报大片 `no_audio`。
-   外部 asr-raw 也走同一入口。
+   切不掉的「大段」（残留 norm 长度 > MaxLinesPerBlock×8）先走
+   **台本锚点预切**（`anchorSplit`）：每行首部 ≤6 个 norm 字符
+   按序在段内定位，命中点为切点、词 ts snap（恒 coarse），未命中
+   行并入邻近块不虚构——>64 行融合输入恢复语句级 DP。锚点
+   失败的残段仍不硬切：块匹配放宽行数（约 len/3，≤64 行）作
+   兜底。有词 ts 时内部切点由台本对齐映射到词边界；无词 ts
+   则全部 `estimated_boundary`；两者都在 `timeline.warnings`
+   记降级说明，绝不误报大片 `no_audio`。外部 asr-raw 也走同一入口。
 1. **归一化**：去标点空白、全角折半角、小写；保留原文字符索引映射，
    使切回原文取 `spoken_text` 时每个真实字符都能还原。
 2. **块级 DP**：`lines × segs` 网格上的最小代价路径，块 ≤
@@ -92,8 +94,12 @@ VoiceMorph 的第二个工作区：**录音是事实来源，台本只是参考*
    `unmatched_audio`/`low_asr_confidence`/`needs_role`）。
    人工编辑写 `edited:true`（只标记被碰过）；显式确认写
    `reviewed:true` 才解除审核门——改文本/角色/勾选不等于审核。
-   `MergeReviewed` 以（line_id, asr_ref, ±2s）为键把编辑和确认并回
-   新草稿——重跑校对不丢人工工作。两份文件 `audio_sha256` 不符时
+   `MergeReviewed` 把编辑和确认并回新草稿——重跑校对不丢人工
+   工作。绑定/丢弃等**对未匹配音频的判决**按稳定片段身份合并：
+   `segment_id` 为主键，id 漂移后降级为 `asr_ref + 时间窗 ±2s +
+   规范化文本前缀锚点`生成候选集，**唯一命中才应用，歧义跳过
+   并保留待审**——共享同一 ASRSegmentID 的兄弟段（融合段切片）
+   绝不互相嫁接 discarded/绑定。两份文件 `audio_sha256` 不符时
    直接拒绝合并（旧审核不许嫁接新录音）。未匹配音频人工指定角色
    后置为 `match_status:"manual"`（人工绑定=审核决定），与正常行
    一样参与渲染。**渲染默认拦截未审核段**进 `skipped`；
