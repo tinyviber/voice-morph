@@ -1,4 +1,5 @@
 import { bridge, inApp } from "./bridge";
+import { initDubbing } from "./dubbing";
 import { ChunkSender, MonitorSupervisor, STALE } from "./monitor-queue";
 import type { MonitorResources } from "./monitor-queue";
 import { isCallError } from "mygo-runtime";
@@ -506,4 +507,27 @@ function encodeWav16(samples: Float32Array, sr: number): Uint8Array {
   return new Uint8Array(buf);
 }
 
+function bindWorkspaceTabs() {
+  const live = $("#tab-live");
+  const dub = $("#tab-dub");
+  const setTab = (which: "live" | "dub") => {
+    live.classList.toggle("on", which === "live");
+    dub.classList.toggle("on", which === "dub");
+    $("#live-pane").hidden = which !== "live";
+    $("#live-actions").hidden = which !== "live";
+    $("#dub-pane").hidden = which !== "dub";
+    // 配音页侧栏换成角色声线面板，隐藏实时预设 rail
+    const rail = document.querySelector<HTMLElement>(".rail");
+    if (rail) rail.hidden = which !== "live";
+    $("#ws-title").textContent = which === "live" ? "实时变声" : "离线配音";
+    $("#ws-sub").textContent = which === "live"
+      ? "麦克风 → Go 引擎 → 监听"
+      : "录音 → ASR 转写 → 台本校对 → 批量变声";
+  };
+  live.addEventListener("click", () => setTab("live"));
+  dub.addEventListener("click", () => setTab("dub"));
+}
+
 void init();
+bindWorkspaceTabs();
+initDubbing();

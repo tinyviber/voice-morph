@@ -35,16 +35,20 @@
       <main class="stage">
         <header class="topbar">
           <div class="topbar-title">
-            <h2>实时变声</h2>
-            <p class="sub">麦克风 → Go 引擎 → 监听</p>
+            <h2 id="ws-title">实时变声</h2>
+            <p class="sub" id="ws-sub">麦克风 → Go 引擎 → 监听</p>
           </div>
-          <div class="topbar-actions">
+          <div class="ws-tabs">
+            <button id="tab-live" class="on">实时变声</button>
+            <button id="tab-dub">离线配音</button>
+          </div>
+          <div class="topbar-actions" id="live-actions">
             <button id="bypass" class="btn ghost" aria-pressed="false" title="对比原声">旁通原声</button>
             <button id="monitor" class="btn primary big">开始监听</button>
           </div>
         </header>
 
-        <section class="cards">
+        <section class="cards" id="live-pane">
           <!-- transport / meters -->
           <div class="card monitor-card">
             <div class="card-head">
@@ -167,6 +171,50 @@
               <a id="download" class="btn ghost sm" download="voicemorph.wav">下载 WAV</a>
             </div>
           </div>
+        </section>
+
+        <!-- ══ 离线配音 workspace ══ -->
+        <section id="dub-pane" class="dub" hidden>
+          <div class="card">
+            <div class="card-head"><h3>输入</h3><span id="dub-model" class="meta"></span></div>
+            <div class="dub-grid">
+              <div class="dub-row"><span>录音 WAV</span><code id="dub-audio" class="dim">未选择</code><button id="dub-pick-audio" class="btn sm">选择</button></div>
+              <div class="dub-row"><span>台本 JSON</span><code id="dub-script" class="dim">未选择</code><button id="dub-pick-script" class="btn sm">选择</button></div>
+              <div class="dub-row"><span>voices.json</span><code id="dub-voices" class="dim">未选择</code><button id="dub-pick-voices" class="btn sm">选择</button></div>
+              <div class="dub-row"><span>输出目录</span><code id="dub-out" class="dim">未选择</code><button id="dub-pick-out" class="btn sm">选择</button></div>
+            </div>
+            <div class="dub-actions">
+              <button id="dub-run" class="btn primary">转写 + 校对</button>
+              <button id="dub-load-timeline" class="btn ghost">打开已有 timeline</button>
+              <button id="dub-pick-model" class="btn ghost">选择模型目录</button>
+              <button id="dub-open-out" class="btn ghost">打开输出目录</button>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-head">
+              <h3>校对审核</h3>
+              <div>
+                <span id="dub-review-count" class="meta"></span>
+                <span id="dub-unmatched" class="meta warn"></span>
+              </div>
+            </div>
+            <div class="seg-wrap">
+              <table class="seg-table">
+                <thead><tr>
+                  <th>#</th><th></th><th>时间(s)</th><th>台本</th><th>实际朗读</th><th>角色</th><th>状态</th><th>审核原因</th><th>选用</th>
+                </tr></thead>
+                <tbody id="dub-seg-body"></tbody>
+              </table>
+            </div>
+            <div class="dub-actions">
+              <button id="dub-save-review" class="btn">保存审核结果</button>
+              <button id="dub-render" class="btn primary">批量渲染</button>
+            </div>
+          </div>
+
+          <div class="card" id="dub-manifest"></div>
+          <div id="dub-toast" class="toast"></div>
         </section>
       </main>
     </div>

@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "voices": {
+    "narrator": {"backend": "dsp", "preset": "normal"},
+    "character-a": {"backend": "dsp", "preset": "natural-woman"}
+  }
+}
