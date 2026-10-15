@@ -147,7 +147,7 @@ func (d *Dubber) Render(timelinePath, voicesPath, outDir string) string {
 	m, err := dubbing.Render(dubbing.RenderOptions{
 		TimelinePath: timelinePath, VoicesPath: voicesPath, OutDir: outDir,
 		WriteSrc: true})
-	if err != nil && m == nil {
+	if err != nil {
 		return errJSON(err)
 	}
 	return okJSON(m)

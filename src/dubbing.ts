@@ -281,10 +281,24 @@ function renderTable() {
     }));
 }
 
+function clearVoicesPath(message = "未选择（请检查新会话的声线配置）") {
+  voicesPath = "";
+  $("#dub-voices").textContent = message;
+}
+
+function setOutDir(path: string, resetVoices = true) {
+  if (path !== outDir && resetVoices) clearVoicesPath();
+  outDir = path;
+  $("#dub-out").textContent = path;
+}
+
 async function pick(field: "audio" | "script" | "voices", title: string, exts: string) {
   const p = await Dubber.pickFile(title, exts);
   if (!p) return;
-  if (field === "audio") { audioPath = p; audioBufs.delete(p); $("#dub-audio").textContent = p; }
+  if (field === "audio") {
+    if (p !== audioPath) clearVoicesPath();
+    audioPath = p; audioBufs.delete(p); $("#dub-audio").textContent = p;
+  }
   if (field === "script") { scriptPath = p; $("#dub-script").textContent = p; }
   if (field === "voices") { voicesPath = p; $("#dub-voices").textContent = p; }
 }
@@ -302,7 +316,7 @@ export function initDubbing() {
   $("#dub-pick-voices").addEventListener("click", () => void pick("voices", "选择 voices.json", "json"));
   $("#dub-pick-out").addEventListener("click", async () => {
     const p = await Dubber.pickDirectory("选择输出目录");
-    if (p) { outDir = p; $("#dub-out").textContent = p; }
+    if (p) setOutDir(p);
   });
   $("#dub-pick-model").addEventListener("click", async () => {
     const p = await Dubber.pickDirectory("选择 SenseVoiceSmall 模型目录");
@@ -316,8 +330,9 @@ export function initDubbing() {
   $("#dub-run").addEventListener("click", async () => {
     if (!audioPath) return toast("先选录音 WAV", true);
     if (!outDir) {
-      outDir = audioPath.replace(/\.[^.]+$/, "") + "-dub";
-      $("#dub-out").textContent = outDir;
+      // The default output path completes the current session setup. A
+      // voice file explicitly chosen for this audio remains applicable.
+      setOutDir(audioPath.replace(/\.[^.]+$/, "") + "-dub", false);
     }
     const btn = $("#dub-run") as HTMLButtonElement;
     btn.disabled = true; btn.textContent = "转写中…（首次加载模型较慢）";
@@ -345,14 +360,12 @@ export function initDubbing() {
       $("#dub-audio").textContent = audioPath;
       // Reopen the session this timeline belongs to — rendering into a
       // stale or empty outDir was a real footgun.
-      outDir = p.replace(/[\\/][^\\/]+$/, "");
-      $("#dub-out").textContent = outDir;
+      setOutDir(p.replace(/[\\/][^\\/]+$/, ""));
       // Session switch: restore this session's voices.json, else clear
       // — reusing the previous session's voice config silently was a
       // real footgun.
       const v = outDir + "/voices.json";
-      voicesPath = "";
-      $("#dub-voices").textContent = "正在读取会话声线配置…";
+      clearVoicesPath("正在读取会话声线配置…");
       try {
         const loaded = await call<TextFileRead>(Dubber.loadTextFile(v));
         if (loaded.exists) {
